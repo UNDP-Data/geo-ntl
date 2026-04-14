@@ -1,8 +1,7 @@
-import json
 
 from pyorbital.orbital import Orbital
 from pyorbital import astronomy
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, time
 from typing import Iterable
 import itertools
 import math
@@ -12,7 +11,26 @@ TLE_URL = 'https://celestrak.org/NORAD/elements/gp.php?GROUP=weather'
 
 def get_satellite_phase(timestamp_str:str=None, sat_name=None, tle_file="weather.tle"):
     """
-    Computes the Phase Offset for a satellite based on a known 'Golden' timestamp.
+    Computes the Phase Offset for a satellite based on a known 'Golden' timestamp extracted from
+    the first file of a given day.
+    The Phase Offset is a mission-specific constant required to align the internal pyorbital
+    propagator with the NOAA ground system’s granule-segmentation logic
+    Why it is required:
+        The VIIRS instrument generates data in 85.4-second increments (granules).
+        However, these granules do not necessarily start at 00:00:00 relative to a TLE Epoch.
+        The Phase Offset acts as the "Temporal Anchor," shifting the theoretical pulse train to match the physical
+        filenames found in the S3 bucket.
+
+        Calibration Procedure:
+
+            Identify a high-quality (Near-Nadir) file in the S3 bucket.
+
+            Extract the timestamp from the filename (e.g., d20260411_t2246330).
+
+            Calculate the difference between this timestamp and the current TLE Epoch.
+
+            Apply the Modulo 85.4 operation to extract the offset.
+
     timestamp_str: Format 'dYYYYMMDD_tHHMMSSs' (e.g., 'd20260412_t0000337')
     sat_name: Name of the satellite (e.g., 'SUOMI NPP')
 
@@ -58,8 +76,10 @@ class VIIRSNavigator:
     A physics-based navigator for VIIRS (S-NPP, NOAA-20/21).
     Synchronizes the 85.4s instrument heartbeat to the TLE Epoch.
     """
+
     # VIIRS Hardware Constant (1025 packets / 12)
-    GRANULE_DUR = 85.416666667
+    GRANULE_DUR = 1025/12.
+
 
     # Satellite-specific clock phase (relative to TLE epoch)
     # Calibrate this ONCE per satellite. It is stable across years.
@@ -74,177 +94,113 @@ class VIIRSNavigator:
         self.orb = Orbital(satellite, tle_file=tle_file)
         self.phase = self.PHASE_OFFSETS.get(satellite, 0.0)
 
+    # def get_start_time(self, bbox, target_date):
+    #     """
+    #     Input: bbox [min_lon, min_lat, max_lon, max_lat]
+    #     Output: 'tHHMMSSs' string for the lead-edge granule.
+    #     """
+    #     # 1. Lead-Edge Trigger (Northernmost boundary for descending passes)
+    #     north_lat, mid_lon = bbox[3], (bbox[0] + bbox[2]) / 2
+    #
+    #     # 2. Identify Peak Time at the entrance of the AOI
+    #     passes = self.orb.get_next_passes(target_date, 24, mid_lon, north_lat, 0, horizon=0)
+    #
+    #     for rise_time, fall_time, max_elev_time in passes:
+    #
+    #         # A. Direction Check (Night passes for NPP are Descending: North -> South)
+    #         pos_start = self.orb.get_lonlatalt(rise_time)
+    #         pos_end = self.orb.get_lonlatalt(fall_time)
+    #         is_descending = pos_end[1] < pos_start[1]
+    #
+    #         # B. Light Check (Astronomical Night: Sun Zenith > 100°)
+    #         sun_zenith = astronomy.sun_zenith_angle(max_elev_time, mid_lon, north_lat)
+    #         is_night = sun_zenith > 100
+    #
+    #         if is_descending and is_night:
+    #
+    #             t_peak = max_elev_time
+    #
+    #             # 3. The Epoch-Pulse Sync (The 'No-Beta' Secret)
+    #             # We use the TLE epoch as the master clock reference.
+    #             t_epoch = self.orb.orbit_elements.epoch
+    #
+    #             # Calculate time elapsed since the TLE was published
+    #             delta_seconds = (t_peak - t_epoch).total_seconds()
+    #
+    #             # Determine the Pulse Index (which 85.4s bucket contains the peak)
+    #             pulse_index = math.floor((delta_seconds - self.phase) / self.GRANULE_DUR)
+    #
+    #             # 4. Snap to the Filename Start Time
+    #             t_start = t_epoch + timedelta(seconds=(pulse_index * self.GRANULE_DUR) + self.phase)
+    #
+    #             # 5. Format to VIIRS standard: tHHMMSSd (d = decisecond)
+    #             decisecond = int(t_start.microsecond / 100000)
+    #             return t_start, t_start.strftime("t%H%M%S") + str(decisecond)
+
     def get_start_time(self, bbox, target_date):
         """
-        Input: bbox [min_lon, min_lat, max_lon, max_lat]
-        Output: 'tHHMMSSs' string for the lead-edge granule.
+        Compute the best/start time(s) for
         """
-        # 1. Lead-Edge Trigger (Northernmost boundary for descending passes)
-        north_lat, mid_lon = bbox[3], (bbox[0] + bbox[2]) / 2
+        # Longitude is the same for both
+        mid_lon = (bbox[0] + bbox[2]) / 2
 
-        # 2. Identify Peak Time at the entrance of the AOI
-        passes = self.orb.get_next_passes(target_date, 24, mid_lon, north_lat, 0, horizon=0)
+        # Latitudes: Top for the trigger, Center for the math
+        north_lat = bbox[3]
+        mid_lat = (bbox[1] + bbox[3]) / 2
 
+        # 1. NIGHT DURATION (Use Mid-Lat for 'Average' Night)
+        doy = target_date.timetuple().tm_yday
+        declination = 0.409 * math.sin(2 * math.pi * (doy - 80) / 365)
+        lat_rad = math.radians(mid_lat)
+        cos_h = -math.tan(lat_rad) * math.tan(declination)
+        night_hrs = int(round(24 - (2 * math.degrees(math.acos(max(-1.0, min(1.0, cos_h)))) / 15)))
+
+        # 2. THE ANCHOR (01:30 AM Local -> UTC)
+
+        utc_anchor = datetime.combine(target_date, time(1, 30)) - timedelta(hours=mid_lon / 15.0)
+
+        # 3. THE TRIGGER (Use North-Lat to find when the satellite ENTERS the box)
+        search_start = utc_anchor - timedelta(hours=night_hrs / 2)
+        passes = self.orb.get_next_passes(search_start, night_hrs, mid_lon, north_lat, 0)
+
+        best_pass = None
+        min_offset_km = 3000/2 # half the scan width
+        min_elevation_angle = 20.0
+        highest_elevation = 0
         for rise_time, fall_time, max_elev_time in passes:
 
-            # A. Direction Check (Night passes for NPP are Descending: North -> South)
+            # Direction Check
             pos_start = self.orb.get_lonlatalt(rise_time)
             pos_end = self.orb.get_lonlatalt(fall_time)
-            is_descending = pos_end[1] < pos_start[1]
 
-            # B. Light Check (Astronomical Night: Sun Zenith > 100°)
-            sun_zenith = astronomy.sun_zenith_angle(max_elev_time, mid_lon, north_lat)
-            is_night = sun_zenith > 100
+            if pos_end[1] < pos_start[1]:  # Descending
+                look = self.orb.get_observer_look(max_elev_time, mid_lon, mid_lat, 0)
+                elevation = look[1]
+                # Check Quality against the CENTER of town
+                sat_lon, _, _ = self.orb.get_lonlatalt(max_elev_time)
+                deg_offset = abs(mid_lon - sat_lon)
+                # Physical distance in km at this latitude
+                offset_km = deg_offset * 111.32 * math.cos(math.radians(mid_lat))
+                #print(rise_time, fall_time, max_elev_time, offset_km, elevation,  self.satellite )
+                if offset_km < min_offset_km:
+                    min_offset_km = offset_km
+                    best_pass = max_elev_time
+                if elevation > highest_elevation:
+                    highest_elevation = elevation
 
-            if is_descending and is_night:
+        if highest_elevation < min_elevation_angle:
+            print(f'blind spot for {self.satellite} on {target_date}')
 
-                t_peak = max_elev_time
+        if best_pass:
+            # Snap to Pulse Train
+            t_epoch = self.orb.orbit_elements.epoch
+            delta_seconds = (best_pass - t_epoch).total_seconds()
+            pulse_index = math.floor((delta_seconds - self.phase) / self.GRANULE_DUR)
+            t_start = t_epoch + timedelta(seconds=(pulse_index * self.GRANULE_DUR) + self.phase)
 
-                # 3. The Epoch-Pulse Sync (The 'No-Beta' Secret)
-                # We use the TLE epoch as the master clock reference.
-                t_epoch = self.orb.orbit_elements.epoch
-
-                # Calculate time elapsed since the TLE was published
-                delta_seconds = (t_peak - t_epoch).total_seconds()
-
-                # Determine the Pulse Index (which 85.4s bucket contains the peak)
-                pulse_index = math.floor((delta_seconds - self.phase) / self.GRANULE_DUR)
-
-                # 4. Snap to the Filename Start Time
-                t_start = t_epoch + timedelta(seconds=(pulse_index * self.GRANULE_DUR) + self.phase)
-
-                # 5. Format to VIIRS standard: tHHMMSSd (d = decisecond)
-                decisecond = int(t_start.microsecond / 100000)
-                return t_start, t_start.strftime("t%H%M%S") + str(decisecond)
-
-def get_viirs_avgpass_time(bbox:Iterable[float], target_date:date=None, horizon=30):
-    """
-    Calculates the surgical rclone glob patterns for Suomi NPP
-    Nighttime Lights granules covering a specific coordinate.
-    """
-
-    # 1. Initialize Orbital
-    # Note: Ensure weather.tle is in your working directory
-    orb = Orbital("SUOMI NPP", tle_file='weather.tle')
-    lons = list(bbox)[0::2]
-    lats = list(bbox)[1::2]
-    max_elev_times = []
-    for lon, lat in itertools.product(lons, lats):
-
-        # 2. Calculate passes for the next 24 hours
-        passes = orb.get_next_passes(target_date, 24, lon, lat, 0, horizon=horizon)
-        for rise_time, fall_time, max_elev_time in passes:
-
-            # A. Direction Check (Night passes for NPP are Descending: North -> South)
-            pos_start = orb.get_lonlatalt(rise_time)
-            pos_end = orb.get_lonlatalt(fall_time)
-            is_descending = pos_end[1] < pos_start[1]
-
-            # B. Light Check (Astronomical Night: Sun Zenith > 100°)
-            sun_zenith = astronomy.sun_zenith_angle(max_elev_time, lon, lat)
-            is_night = sun_zenith > 100
-
-            if is_descending and is_night:
-                print(f'lon: {lon} lat: {lat} rise time {rise_time}  fall time {fall_time}  max elev time {max_elev_time}')
-                max_elev_times.append(max_elev_time)
-
-    timestamps = [d.timestamp() for d in max_elev_times]
-
-    # 2. Average the timestamps
-    avg_timestamp = sum(timestamps) / len(timestamps)
-
-    # 3. Convert back to datetime
-    avg_date = datetime.fromtimestamp(avg_timestamp)
-
-    print(f"Average Datetime: {avg_date}")
-
-def get_viirs_pass_time(lat, lon, target_date:date=None, horizon=30):
-    """
-    Calculates the surgical rclone glob patterns for Suomi NPP
-    Nighttime Lights granules covering a specific coordinate.
-    """
-
-    # 1. Initialize Orbital
-    # Note: Ensure weather.tle is in your working directory
-    orb = Orbital("SUOMI NPP", tle_file='weather.tle')
-
-    # 2. Calculate passes for the next 24 hours
-    passes = orb.get_next_passes(target_date, 24, lon, lat, 0, horizon=horizon)
-
-    valid_globs = []
-
-    for rise_time, fall_time, max_elev_time in passes:
-        # A. Direction Check (Night passes for NPP are Descending: North -> South)
-        pos_start = orb.get_lonlatalt(rise_time)
-        pos_end = orb.get_lonlatalt(fall_time)
-        is_descending = pos_end[1] < pos_start[1]
-
-        # B. Light Check (Astronomical Night: Sun Zenith > 100°)
-        sun_zenith = astronomy.sun_zenith_angle(max_elev_time, lon, lat)
-        is_night = sun_zenith > 100
-
-        if is_descending and is_night:
-            # C. Extract Geometry
-            look = orb.get_observer_look(max_elev_time, lon, lat, 0)
-            max_elev = look[1]
-
-            # D. The "Sandwich Strategy" (Minute and Minute-1)
-            hour = max_elev_time.strftime("%H")
-            curr_min = max_elev_time.strftime("%M")
-            prev_min = (max_elev_time - timedelta(minutes=1)).strftime("%M")
-
-            # Create the rclone-ready glob pattern
-            glob = f"t{hour}{{{prev_min},{curr_min}}}"
-
-            valid_globs.append({
-                "time": max_elev_time,
-                "elevation": round(max_elev, 1),
-                "glob": glob
-            })
-
-    return valid_globs
+            return t_start, t_start.strftime("d%Y%m%d_t%H%M%S") + str(int(t_start.microsecond / 100000)), round(float(min_offset_km), 2)
 
 
-def find_granule_by_intersection(bbox, target_date, ):
-    orb = Orbital(satellite="SUOMI NPP", tle_file='weather.tle')
-
-    # 1. The Pulse Train (No Daily Anchor needed)
-    # We start from a fixed epoch. S-NPP granules are generally aligned
-    # to a consistent pulse relative to the start of the UTC day.
-    # Note: If it drifts, this is where the "missing piece" is.
-    t_pulse = 85.416666667
-
-    # 2. Narrow the Search (Find Peak for BBOX center)
-    mid_lat, mid_lon = (bbox[1] + bbox[3]) / 2, (bbox[0] + bbox[2]) / 2
-    t_peak = orb.get_next_passes(target_date, 24, mid_lon, mid_lat, 0)[0][2]
-
-    # 3. Test the "Candidate Granules" around that Peak
-    # We check the granule that contains the Peak, and the ones immediately before/after
-    sec_since_midnight = (t_peak - t_peak.replace(hour=0, minute=0, second=0)).total_seconds()
-
-    # We find the three closest "Heartbeats"
-    possible_indices = [
-        math.floor(sec_since_midnight / t_pulse) - 1,
-        math.floor(sec_since_midnight / t_pulse),
-        math.floor(sec_since_midnight / t_pulse) + 1
-    ]
-
-    for idx in possible_indices:
-        t_start_sec = idx * t_pulse
-        t_start = t_peak.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(seconds=t_start_sec)
-
-        # 4. Project the 'Theoretical Extent' (The Shutter)
-        # We check the Nadir position at the start, middle, and end of this 85.4s window
-        pos_start = orb.get_lonlatalt(t_start)
-        pos_end = orb.get_lonlatalt(t_start + timedelta(seconds=t_pulse))
-
-        # Logic: If your BBOX Latitude is between the Start and End Latitude
-        # of the Nadir track, you have found the "Real Minute."
-        # (For Descending: Start Lat > BBOX Lat > End Lat)
-        if pos_start[1] > bbox[3] > pos_end[1]:
-            return t_start.strftime("%H%M%S") + str(int(t_start.microsecond / 100000))
-
-    return "No Intersection Found"
 
 # --- Usage Example ---
 my_lat, my_lon = 49.75, 16.5
@@ -266,15 +222,18 @@ bboxes = [
 names = 'Tehran,Abadan,Khorramshahr,Isfahan,Dezful,Ahvaz,Tabriz,Kermanshah,Shiraz,Qom'
 names= names.split(',')
 data = list(zip(names, bboxes))
-nav = VIIRSNavigator(satellite='NOAA-20')
+sat = 'NOAA-21'
 
 
-start_time, ststr = nav.get_start_time(bbox, target_date)
-print(f"Computed start time : {start_time} {ststr}")
 
-for n, bbox in data:
-    st, sts = nav.get_start_time(bbox, target_date)
-    print(n, st, sts)
+# start_time, ststr = nav.get_start_time(bbox, target_date)
+# print(f"Computed start time : {start_time} {ststr}")
+for s in 'SUOMI-NPP,NOAA-20,NOAA-21'.split(','):
+    for n, bbox in data:
+        nav = VIIRSNavigator(satellite=s)
+        if n == 'Shiraz':
+            r = nav.get_start_time(bbox, target_date)
+            print(s, n, r)
 
 
 
