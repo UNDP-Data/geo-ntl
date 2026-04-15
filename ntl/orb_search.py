@@ -5,6 +5,7 @@ import math
 import httpx
 import time
 import logging
+from typing import Iterable, Optional
 logger = logging.getLogger(__name__)
 
 
@@ -84,9 +85,15 @@ class VIIRSNavigator:
     GRANULE_DUR = 1025/12.
     # THE OFFLINE MASTER SEEDS (Locked in April 2026)
     # Drift is 'Seconds shifted per 24 hours'
+    #
+    # the drifting was comuted by analyiz the tiomestamp of the first image produced by each satellite
+    # ex for SNPP using rclone
+    # for i in $(seq 0 30); do T_DATE=$(date -d "2026-04-15 - $i days" +%Y/%m/%d); echo -n "$T_DATE | "; rclone lsf --s3-provider AWS --s3-region us-east-1 --s3-no-check-bucket ":s3:noaa-nesdis-snpp-pds/VIIRS-DNB-SDR/$T_DATE/" --include "*t00*.h5" -q | sort | head -n 1 | grep -o 't[0-9]\{7\}' | sed 's/t//'; done
+
+
     SAT_CONFIGS = {
-        "NOAA-21": {"ref": date(2026, 4, 14), "phase": 67.2, "drift": -25.80},
-        "NOAA-20": {"ref": date(2026, 4, 14), "phase": 68.0, "drift": -25.71},
+        "NOAA 21": {"ref": date(2026, 4, 14), "phase": 67.2, "drift": -25.80},
+        "NOAA 20": {"ref": date(2026, 4, 14), "phase": 68.0, "drift": -25.71},
         "SUOMI NPP": {"ref": date(2026, 4, 14), "phase": 68.4, "drift": -25.37}
     }
     MIN_ELEVATION_ANGLE = 20.0
@@ -96,10 +103,10 @@ class VIIRSNavigator:
 
         self.tle_file = self.get_tle(tle_file)
 
-        self.orb = Orbital(satellite, tle_file=str(self.tle_file))
+        self.orb = Orbital(satellite=self.satellite, tle_file=str(self.tle_file))
 
         self.cfg = self.SAT_CONFIGS[self.satellite]
-        self.phase = self.get_phase_for_date(target_date)
+
 
 
     def fetch_tle(self):
@@ -144,7 +151,19 @@ class VIIRSNavigator:
                     # Validate that we actually got a TLE (should start with name or '1 ')
                     data = response.text.strip()
                     if "1 " in data:
-                        merged_tle += data + "\n"
+                        # Split the response into lines
+                        lines = [l.strip() for l in response.text.strip().splitlines() if l.strip()]
+
+                        # CelesTrak usually returns 3 lines (Name, L1, L2)
+                        # or 2 lines (L1, L2) if CATNR is used.
+                        # We only care about the last two lines (the TLE data)
+                        if len(lines) >= 2 and lines[-2].startswith("1 "):
+                            tle_l1 = lines[-2]
+                            tle_l2 = lines[-1]
+
+                            # We MANUALLY prepend our clean name
+                            merged_tle += f"{name}\n{tle_l1}\n{tle_l2}\n"
+                            logger.info(f"✅ Forced Clean Name: {name}")
 
                     else:
                         logger.error(f" Received empty or invalid TLE data for {name} satellite .")
@@ -193,6 +212,7 @@ class VIIRSNavigator:
         """
         Compute the best/start time(s) for
         """
+        phase = self.get_phase_for_date(target_date)
         # Longitude is the same for both
         mid_lon = (bbox[0] + bbox[2]) / 2
 
@@ -248,46 +268,77 @@ class VIIRSNavigator:
             delta_seconds = (best_pass - t_midnight).total_seconds()
 
             # 2. Pulse-Sync Math
-            pulse_index = math.floor((delta_seconds - self.phase) / self.GRANULE_DUR)
-            t_start = t_midnight + timedelta(seconds=(pulse_index * self.GRANULE_DUR) + self.phase)
+            pulse_index = math.floor((delta_seconds - phase) / self.GRANULE_DUR)
+            t_start = t_midnight + timedelta(seconds=(pulse_index * self.GRANULE_DUR) + phase)
 
             # Format: dYYYYMMDD_tHHMMSSs
-            ststr = t_start.strftime("d%Y%m%d_t%H%M%S") + str(int(t_start.microsecond / 100000)), round(float(min_offset_km), 2)
-            return t_start, ststr
-
-# --- Usage Example ---
-my_lat, my_lon = 49.75, 16.5
-target_date = datetime(2026, 4, 12)
-czbbox = 14.0, 48.5, 19.0, 51.0
-
-bboxes = [
-    [51.3337,35.6443,51.4443,35.7341],
-    [48.2393,30.2947,48.3433,30.3845],
-    [48.1104,30.3926,48.2146,30.4824],
-    [51.6147,32.6097,51.7213,32.6995],
-    [48.3468,32.3384,48.4532,32.4282],
-    [48.618,31.2734,48.7232,31.3632],
-    [46.2371,38.0324,46.3513,38.1222],
-    [47.0106,34.2693,47.1194,34.3591],
-    [52.532,29.5469,52.6354,29.6367],
-    [50.8218,34.5952,50.931,34.685]
-]
-names = 'Tehran,Abadan,Khorramshahr,Isfahan,Dezful,Ahvaz,Tabriz,Kermanshah,Shiraz,Qom'
-names= names.split(',')
-data = list(zip(names, bboxes))
-sat = 'NOAA-21'
+            ststr = t_start.strftime("d%Y%m%d_t%H%M%S") + str(int(t_start.microsecond / 100000))
+            return self.satellite, t_start, ststr,  round(float(min_offset_km), 2)
 
 
 
+def compute_best_pass(satellite:Optional[str]=None, target_date:date=None, bbox:Iterable[float] = None)->Iterable[Path]:
+    """
+        Given an event associated with a target date and a geographic area of interest represented through a
+        bounding box identify the best VIIRS DNB satellite (Suomi NPP, NOAA 20, NOAA 21) using pyorbital.
 
-for s in 'SUOMI NPP,NOAA-20,NOAA-21'.split(','):
-    for n, bbox in data:
-        nav = VIIRSNavigator(satellite=s)
-        if n == 'Shiraz':
-            r = nav.get_start_time(bbox, target_date)
-            #print(s, n, r)
-            czr = nav.get_start_time(czbbox, target_date)
-            print(f"CZ : {s} {czr}")
+        For each satellite there are several passes given away by pyorbital and the best candidate image is selected so
+        that the elevation angle is maximized and the distance from the center of bbox to the sub-satellite point is
+        minimized.
 
+        Consequently, the best candidate from all satellites is selected based on the offset distance but only if
+        a satellite is not specified. Otherwise the candidate will be selected from the specific satellite.
+        Args:
+            @satellite, str, the name of teh desired satellite or None to use all
+            @target_date, date the desired date for which the pass will be selected
+            @bbox,  lonmin, latmin, lonmax, latmax, iterable of floats
+
+        Returns:
+            an iterable with information related to the best pass
+            satellite, datetime when the satellite started the scan, a timestamp to be sued for filtering cloud buckets for data
+            and the distance offset in km from the center of bbox to the sub-satellite point at maximum elevation
+
+
+
+    """
+    satellite_names = list(VIIRSNavigator.SAT_CONFIGS.keys())
+    assert isinstance(target_date, date), f'invalid target date {target_date}'
+    satellites = [satellite] if satellite not in [None, ''] else satellite_names
+    results = []
+    for sat in satellites:
+        nav = VIIRSNavigator(satellite=sat)
+        result = nav.get_start_time(bbox, target_date)
+        results.append(result)
+    if results:
+        sorted_results = sorted(results, key=lambda e:e[-1], reverse=True)
+        return sorted_results[-1]
+
+    else:
+        logger.info(f'Could not find NTL data from NOAA satellites {satellite_names} for {target_date} and {bbox} ')
+
+if __name__ == '__main__':
+
+    # --- Usage Example ---
+    my_lat, my_lon = 49.75, 16.5
+    target_date = datetime(2026, 4, 2)
+    czbbox = 14.0, 48.5, 19.0, 51.0
+
+    bboxes = [
+        [51.3337,35.6443,51.4443,35.7341],
+        [48.2393,30.2947,48.3433,30.3845],
+        [48.1104,30.3926,48.2146,30.4824],
+        [51.6147,32.6097,51.7213,32.6995],
+        [48.3468,32.3384,48.4532,32.4282],
+        [48.618,31.2734,48.7232,31.3632],
+        [46.2371,38.0324,46.3513,38.1222],
+        [47.0106,34.2693,47.1194,34.3591],
+        [52.532,29.5469,52.6354,29.6367],
+        [50.8218,34.5952,50.931,34.685]
+    ]
+    names = 'Tehran,Abadan,Khorramshahr,Isfahan,Dezful,Ahvaz,Tabriz,Kermanshah,Shiraz,Qom'
+    names= names.split(',')
+    data = list(zip(names, bboxes))
+    r  = compute_best_pass(target_date=target_date, bbox=bboxes[-1])
+    print(r)
 
 
