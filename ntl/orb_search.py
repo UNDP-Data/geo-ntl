@@ -199,7 +199,7 @@ class VIIRSNavigator:
         # 1. Does it exist and is it fresh? (7200 seconds = 2 hours)
         if cache_file.exists() and cache_file.stat().st_size > 0:
             age = time.time() - cache_file.stat().st_mtime
-            if age < 7200:
+            if age < 12*3600:
                 return cache_file
 
         # 2. If not, fetch and save (This only happens once every 2 hours)
@@ -327,11 +327,15 @@ def compute_best_pass(satellite:Optional[str]=None, target_date:date=None, bbox:
         logger.info(f'Could not find NTL data from NOAA satellites {satellite_names} for {target_date} and {bbox} ')
 
 if __name__ == '__main__':
-    logger = logging.getLogger()
+    import asyncio
+    from ntl.download import find_and_fetch_ntl
     logging.basicConfig()
+    logger = logging.getLogger()
+
     logger.setLevel(logging.INFO)
     logging.getLogger('httpx').setLevel(logging.WARNING)
     logger.name = 'ntlcli'
+
     # --- Usage Example ---
     my_lat, my_lon = 49.75, 16.5
     target_date = datetime(2026, 4, 2)
@@ -352,7 +356,10 @@ if __name__ == '__main__':
     names = 'Tehran,Abadan,Khorramshahr,Isfahan,Dezful,Ahvaz,Tabriz,Kermanshah,Shiraz,Qom'
     names= names.split(',')
     data = list(zip(names, bboxes))
-    r  = compute_best_pass(target_date=target_date, bbox=bboxes[-1])
-    print(r)
+    sat, start_time, template_str, offset_km  = compute_best_pass(target_date=target_date, bbox=bboxes[-1])
+    print(sat, template_str)
+    asyncio.run(find_and_fetch_ntl(
+        satellite=sat,dt=start_time
+    ))
 
 
