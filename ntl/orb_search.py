@@ -1,10 +1,13 @@
-
 from pyorbital.orbital import Orbital
-from pyorbital import astronomy
-from datetime import datetime, timedelta, date, time
-from typing import Iterable
-import itertools
+from datetime import datetime, timedelta, date, time as dtime
+from pathlib import Path
 import math
+import httpx
+import time
+import logging
+logger = logging.getLogger(__name__)
+
+
 TLE_URL = 'https://celestrak.org/NORAD/elements/gp.php?GROUP=weather'
 
 
@@ -79,63 +82,112 @@ class VIIRSNavigator:
 
     # VIIRS Hardware Constant (1025 packets / 12)
     GRANULE_DUR = 1025/12.
-
-
-    # Satellite-specific clock phase (relative to TLE epoch)
-    # Calibrate this ONCE per satellite. It is stable across years.
-    PHASE_OFFSETS = {
-        "SUOMI NPP": 6.1756,
-        "NOAA-20": 20.2287,
-        "NOAA-21": 71.2307
+    # THE OFFLINE MASTER SEEDS (Locked in April 2026)
+    # Drift is 'Seconds shifted per 24 hours'
+    SAT_CONFIGS = {
+        "NOAA-21": {"ref": date(2026, 4, 14), "phase": 67.2, "drift": -25.80},
+        "NOAA-20": {"ref": date(2026, 4, 14), "phase": 68.0, "drift": -25.71},
+        "SUOMI NPP": {"ref": date(2026, 4, 14), "phase": 68.4, "drift": -25.37}
     }
+    MIN_ELEVATION_ANGLE = 20.0
 
-    def __init__(self, satellite="SUOMI NPP", tle_file="weather.tle"):
+    def __init__(self, satellite="SUOMI NPP", tle_file='/tmp/rapida.tle'):
         self.satellite = satellite
-        self.orb = Orbital(satellite, tle_file=tle_file)
-        self.phase = self.PHASE_OFFSETS.get(satellite, 0.0)
 
-    # def get_start_time(self, bbox, target_date):
-    #     """
-    #     Input: bbox [min_lon, min_lat, max_lon, max_lat]
-    #     Output: 'tHHMMSSs' string for the lead-edge granule.
-    #     """
-    #     # 1. Lead-Edge Trigger (Northernmost boundary for descending passes)
-    #     north_lat, mid_lon = bbox[3], (bbox[0] + bbox[2]) / 2
-    #
-    #     # 2. Identify Peak Time at the entrance of the AOI
-    #     passes = self.orb.get_next_passes(target_date, 24, mid_lon, north_lat, 0, horizon=0)
-    #
-    #     for rise_time, fall_time, max_elev_time in passes:
-    #
-    #         # A. Direction Check (Night passes for NPP are Descending: North -> South)
-    #         pos_start = self.orb.get_lonlatalt(rise_time)
-    #         pos_end = self.orb.get_lonlatalt(fall_time)
-    #         is_descending = pos_end[1] < pos_start[1]
-    #
-    #         # B. Light Check (Astronomical Night: Sun Zenith > 100°)
-    #         sun_zenith = astronomy.sun_zenith_angle(max_elev_time, mid_lon, north_lat)
-    #         is_night = sun_zenith > 100
-    #
-    #         if is_descending and is_night:
-    #
-    #             t_peak = max_elev_time
-    #
-    #             # 3. The Epoch-Pulse Sync (The 'No-Beta' Secret)
-    #             # We use the TLE epoch as the master clock reference.
-    #             t_epoch = self.orb.orbit_elements.epoch
-    #
-    #             # Calculate time elapsed since the TLE was published
-    #             delta_seconds = (t_peak - t_epoch).total_seconds()
-    #
-    #             # Determine the Pulse Index (which 85.4s bucket contains the peak)
-    #             pulse_index = math.floor((delta_seconds - self.phase) / self.GRANULE_DUR)
-    #
-    #             # 4. Snap to the Filename Start Time
-    #             t_start = t_epoch + timedelta(seconds=(pulse_index * self.GRANULE_DUR) + self.phase)
-    #
-    #             # 5. Format to VIIRS standard: tHHMMSSd (d = decisecond)
-    #             decisecond = int(t_start.microsecond / 100000)
-    #             return t_start, t_start.strftime("t%H%M%S") + str(decisecond)
+        self.tle_file = self.get_tle(tle_file)
+
+        self.orb = Orbital(satellite, tle_file=str(self.tle_file))
+
+        self.cfg = self.SAT_CONFIGS[self.satellite]
+        self.phase = self.get_phase_for_date(target_date)
+
+
+    def fetch_tle(self):
+        """
+        Surgically fetches VIIRS TLEs one-by-one to avoid query errors
+        and IP bans. Merges them into a single in-memory string.
+        """
+        # 37849: Suomi-NPP | 43013: NOAA-20 | 54234: NOAA-21
+        targets = {
+            "37849": "SUOMI NPP",
+            "43013": "NOAA 20",
+            "54234": "NOAA 21"
+        }
+
+        merged_tle = ""
+
+        # Using the .org domain directly to avoid the 301 redirect penalty
+        base_url = "https://celestrak.org/NORAD/elements/gp.php"
+
+        # A professional User-Agent is your best shield against bans
+        headers = {
+            'User-Agent': 'UNDP RAPIDA-Engine)',
+            'Accept': 'text/plain'
+        }
+
+
+        with httpx.Client(timeout=15.0, follow_redirects=True) as client:
+            for catnr, name in targets.items():
+                params = {
+                    'CATNR': catnr,
+                    'FORMAT': 'TLE'
+                }
+
+                try:
+                    response = client.get(base_url, params=params, headers=headers)
+
+                    # RULE: If we hit an error, STOP. Don't hammer the server.
+                    if response.status_code != 200:
+                        logger.error(f"🛑 Error {response.status_code} for {name}. Aborting to avoid IP ban.")
+                        break
+
+                    # Validate that we actually got a TLE (should start with name or '1 ')
+                    data = response.text.strip()
+                    if "1 " in data:
+                        merged_tle += data + "\n"
+
+                    else:
+                        logger.error(f" Received empty or invalid TLE data for {name} satellite .")
+
+                except Exception as e:
+                    logger.error(f"   ❌ Network error while fetching TLE on {name}: {e}")
+                    break
+
+                # THE "GOOD CITIZEN" DELAY:
+                # CelesTrak specifically asks for breaks between requests.
+                time.sleep(2.0)
+
+        if not merged_tle:
+            raise RuntimeError("🚨 Failed to fetch any TLE data. Probably IP-blocked. Should reset in two ours.\
+             Alternatively download manually 'https://celestrak.org/NORAD/elements/gp.php?GROUP=weather' to /tmp/rapida_tle.txt")
+
+        return merged_tle
+
+    def get_tle(self, tle_file ):
+        # Pathlib handles the '/' vs '\' slash drama automatically
+        cache_file = Path(tle_file)
+
+        # 1. Does it exist and is it fresh? (7200 seconds = 2 hours)
+        if cache_file.exists() and cache_file.stat().st_size > 0:
+            age = time.time() - cache_file.stat().st_mtime
+            if age < 7200:
+                return cache_file
+
+        # 2. If not, fetch and save (This only happens once every 2 hours)
+        with open(cache_file, 'wt+') as tfile:
+            tle_content = self.fetch_tle()
+            tfile.write(tle_content)
+        return cache_file
+
+    def get_phase_for_date(self, target_date):
+        """Calculates the 100% offline phase for any day."""
+        days_delta = (target_date.date() - self.cfg["ref"]).days
+
+        # Predicted Phase = Initial + (Drift * Days)
+        # Modulo solves the 'Midnight Hiccup' wrap-around automatically
+        predicted = (self.cfg["phase"] + (days_delta * self.cfg["drift"])) % self.GRANULE_DUR
+        return round(predicted, 1)
+
 
     def get_start_time(self, bbox, target_date):
         """
@@ -157,7 +209,7 @@ class VIIRSNavigator:
 
         # 2. THE ANCHOR (01:30 AM Local -> UTC)
 
-        utc_anchor = datetime.combine(target_date, time(1, 30)) - timedelta(hours=mid_lon / 15.0)
+        utc_anchor = datetime.combine(target_date, dtime(1, 30)) - timedelta(hours=mid_lon / 15.0)
 
         # 3. THE TRIGGER (Use North-Lat to find when the satellite ENTERS the box)
         search_start = utc_anchor - timedelta(hours=night_hrs / 2)
@@ -165,7 +217,6 @@ class VIIRSNavigator:
 
         best_pass = None
         min_offset_km = 3000/2 # half the scan width
-        min_elevation_angle = 20.0
         highest_elevation = 0
         for rise_time, fall_time, max_elev_time in passes:
 
@@ -188,24 +239,26 @@ class VIIRSNavigator:
                 if elevation > highest_elevation:
                     highest_elevation = elevation
 
-        if highest_elevation < min_elevation_angle:
-            print(f'blind spot for {self.satellite} on {target_date}')
+        if highest_elevation < self.MIN_ELEVATION_ANGLE: # is it valuable
+            logger.info(f'Blind spot for {self.satellite} on {target_date}')
 
         if best_pass:
-            # Snap to Pulse Train
-            t_epoch = self.orb.orbit_elements.epoch
-            delta_seconds = (best_pass - t_epoch).total_seconds()
+            # Anchor to Midnight UTC of the target day
+            t_midnight = datetime.combine(target_date.date(), dtime(0, 0, 0))
+            delta_seconds = (best_pass - t_midnight).total_seconds()
+
+            # 2. Pulse-Sync Math
             pulse_index = math.floor((delta_seconds - self.phase) / self.GRANULE_DUR)
-            t_start = t_epoch + timedelta(seconds=(pulse_index * self.GRANULE_DUR) + self.phase)
+            t_start = t_midnight + timedelta(seconds=(pulse_index * self.GRANULE_DUR) + self.phase)
 
-            return t_start, t_start.strftime("d%Y%m%d_t%H%M%S") + str(int(t_start.microsecond / 100000)), round(float(min_offset_km), 2)
-
-
+            # Format: dYYYYMMDD_tHHMMSSs
+            ststr = t_start.strftime("d%Y%m%d_t%H%M%S") + str(int(t_start.microsecond / 100000)), round(float(min_offset_km), 2)
+            return t_start, ststr
 
 # --- Usage Example ---
 my_lat, my_lon = 49.75, 16.5
 target_date = datetime(2026, 4, 12)
-bbox = 14.0, 48.5, 19.0, 51.0
+czbbox = 14.0, 48.5, 19.0, 51.0
 
 bboxes = [
     [51.3337,35.6443,51.4443,35.7341],
@@ -226,14 +279,15 @@ sat = 'NOAA-21'
 
 
 
-# start_time, ststr = nav.get_start_time(bbox, target_date)
-# print(f"Computed start time : {start_time} {ststr}")
-for s in 'SUOMI-NPP,NOAA-20,NOAA-21'.split(','):
+
+for s in 'SUOMI NPP,NOAA-20,NOAA-21'.split(','):
     for n, bbox in data:
         nav = VIIRSNavigator(satellite=s)
         if n == 'Shiraz':
             r = nav.get_start_time(bbox, target_date)
-            print(s, n, r)
+            #print(s, n, r)
+            czr = nav.get_start_time(czbbox, target_date)
+            print(f"CZ : {s} {czr}")
 
 
 
