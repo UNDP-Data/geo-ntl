@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, date, time as dtime
 from pathlib import Path
 import math
 import httpx
+from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TaskProgressColumn
 import time
 import logging
 from typing import Iterable, Optional
@@ -132,49 +133,58 @@ class VIIRSNavigator:
             'Accept': 'text/plain'
         }
 
+        with Progress(disable=False, console=None, transient=True) as progress:
 
-        with httpx.Client(timeout=15.0, follow_redirects=True) as client:
-            for catnr, name in targets.items():
-                params = {
-                    'CATNR': catnr,
-                    'FORMAT': 'TLE'
-                }
+            total_task = progress.add_task("[cyan]Initializing TLE fetch...", total=len(targets))
 
-                try:
-                    response = client.get(base_url, params=params, headers=headers)
+            with httpx.Client(timeout=15.0, follow_redirects=True) as client:
+                for catnr, name in targets.items():
+                    params = {
+                        'CATNR': catnr,
+                        'FORMAT': 'TLE'
+                    }
 
-                    # RULE: If we hit an error, STOP. Don't hammer the server.
-                    if response.status_code != 200:
-                        logger.error(f"🛑 Error {response.status_code} for {name}. Aborting to avoid IP ban.")
+                    try:
+                        response = client.get(base_url, params=params, headers=headers)
+
+                        # RULE: If we hit an error, STOP. Don't hammer the server.
+                        if response.status_code != 200:
+                            progress.console.log(f"🛑 Error {response.status_code} for {name}. Aborting to avoid IP ban.")
+                            break
+
+                        # Validate that we actually got a TLE (should start with name or '1 ')
+                        data = response.text.strip()
+                        if "1 " in data:
+                            # Split the response into lines
+                            lines = [l.strip() for l in response.text.strip().splitlines() if l.strip()]
+
+                            # CelesTrak usually returns 3 lines (Name, L1, L2)
+                            # or 2 lines (L1, L2) if CATNR is used.
+                            # We only care about the last two lines (the TLE data)
+                            if len(lines) >= 2 and lines[-2].startswith("1 "):
+                                tle_l1 = lines[-2]
+                                tle_l2 = lines[-1]
+
+                                # We MANUALLY prepend our clean name
+                                merged_tle += f"{name}\n{tle_l1}\n{tle_l2}\n"
+                                progress.advance(total_task)
+                                progress.console.log(f"[green]✅ Successfully fetched TLE for {name}")
+
+                        else:
+                            progress.console.log(f"[yellow]⚠️ Received invalid data for {name}.")
+
+                    except Exception as e:
+                        progress.console.log(f"[red]❌ Network error on {name}: {e}")
                         break
 
-                    # Validate that we actually got a TLE (should start with name or '1 ')
-                    data = response.text.strip()
-                    if "1 " in data:
-                        # Split the response into lines
-                        lines = [l.strip() for l in response.text.strip().splitlines() if l.strip()]
+                    # THE "GOOD CITIZEN" DELAY:
+                    # CelesTrak specifically asks for breaks between requests.
+                    # Advance the bar and update description for the "Good Citizen" sleep
 
-                        # CelesTrak usually returns 3 lines (Name, L1, L2)
-                        # or 2 lines (L1, L2) if CATNR is used.
-                        # We only care about the last two lines (the TLE data)
-                        if len(lines) >= 2 and lines[-2].startswith("1 "):
-                            tle_l1 = lines[-2]
-                            tle_l2 = lines[-1]
-
-                            # We MANUALLY prepend our clean name
-                            merged_tle += f"{name}\n{tle_l1}\n{tle_l2}\n"
-                            logger.info(f"✅ Forced Clean Name: {name}")
-
-                    else:
-                        logger.error(f" Received empty or invalid TLE data for {name} satellite .")
-
-                except Exception as e:
-                    logger.error(f"   ❌ Network error while fetching TLE on {name}: {e}")
-                    break
-
-                # THE "GOOD CITIZEN" DELAY:
-                # CelesTrak specifically asks for breaks between requests.
-                time.sleep(2.0)
+                    if catnr != list(targets.keys())[-1]:  # Don't sleep after the last target
+                        progress.update(total_task,
+                                        description=f"[dim white]Respecting CelesTrak rate limits (2s)...")
+                        time.sleep(2.0)
 
         if not merged_tle:
             raise RuntimeError("🚨 Failed to fetch any TLE data. Probably IP-blocked. Should reset in two ours.\
@@ -189,7 +199,7 @@ class VIIRSNavigator:
         # 1. Does it exist and is it fresh? (7200 seconds = 2 hours)
         if cache_file.exists() and cache_file.stat().st_size > 0:
             age = time.time() - cache_file.stat().st_mtime
-            if age < 7200:
+            if age < 12*3600:
                 return cache_file
 
         # 2. If not, fetch and save (This only happens once every 2 hours)
@@ -317,6 +327,14 @@ def compute_best_pass(satellite:Optional[str]=None, target_date:date=None, bbox:
         logger.info(f'Could not find NTL data from NOAA satellites {satellite_names} for {target_date} and {bbox} ')
 
 if __name__ == '__main__':
+    import asyncio
+    from ntl.download import find_and_fetch_ntl
+    logging.basicConfig()
+    logger = logging.getLogger()
+
+    logger.setLevel(logging.INFO)
+    logging.getLogger('httpx').setLevel(logging.WARNING)
+    logger.name = 'ntlcli'
 
     # --- Usage Example ---
     my_lat, my_lon = 49.75, 16.5
@@ -338,7 +356,10 @@ if __name__ == '__main__':
     names = 'Tehran,Abadan,Khorramshahr,Isfahan,Dezful,Ahvaz,Tabriz,Kermanshah,Shiraz,Qom'
     names= names.split(',')
     data = list(zip(names, bboxes))
-    r  = compute_best_pass(target_date=target_date, bbox=bboxes[-1])
-    print(r)
+    sat, start_time, template_str, offset_km  = compute_best_pass(target_date=target_date, bbox=bboxes[-1])
+    print(sat, template_str)
+    asyncio.run(find_and_fetch_ntl(
+        satellite=sat,dt=start_time
+    ))
 
 
