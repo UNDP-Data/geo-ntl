@@ -348,7 +348,7 @@ if __name__ == '__main__':
     logging.basicConfig()
     logger = logging.getLogger()
 
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(logging.INFO)
     logging.getLogger('httpx').setLevel(logging.WARNING)
     logger.name = 'ntlcli'
 
@@ -372,6 +372,7 @@ if __name__ == '__main__':
     names = 'Tehran,Abadan,Khorramshahr,Isfahan,Dezful,Ahvaz,Tabriz,Kermanshah,Shiraz,Qom'
     names= names.split(',')
     data = list(zip(names, bboxes))
+
     # sat, start_time, template_str, offset_km = compute_best_pass(target_date=target_date, bbox=bboxes[-1])
     # print(sat, template_str)
     # asyncio.run(find_and_fetch_ntl(
@@ -380,7 +381,9 @@ if __name__ == '__main__':
 
     nairobi_bbox = 36.64, -1.45,37.1, -1.14
     target_date = datetime(2026, 4, 17)
-    r = compute_best_pass(target_date=target_date, bbox=nairobi_bbox)
-
-
+    sat, start_time, template_str, offset_km = compute_best_pass(target_date=target_date, bbox=nairobi_bbox)
+    from ntl.download import find_and_fetch_ntl
+    asyncio.run(find_and_fetch_ntl(
+        satellite=sat, dt=start_time, targets=['VIIRS-JRR-CloudMask']
+    ))
 
