@@ -4,7 +4,6 @@ import obstore
 from datetime import datetime
 from rich.progress import Progress
 import asyncio
-
 from ntl.orb_search import logger
 
 # Universal config for anonymous public access
@@ -65,12 +64,8 @@ async def fetch_file(satellite:str=None, provider:str=None, path:str=None, size:
 
 
 
-async def find_and_fetch_ntl(satellite:str=None, dt:datetime=None):
-    """
-    date_path: "2026/04/11"
-    ststr: "t2156485"
-    """
-    targets = ["VIIRS-DNB-SDR", "VIIRS-DNB-GEO"]
+async def find_ntl(satellite:str=None, dt:datetime=None,
+        targets:list[str]= ["VIIRS-DNB-SDR", "VIIRS-DNB-GEO", "VIIRS-JRR-CloudMask"]):
     found_paths = {}
     # Usage:
     stores = viirs_stores[satellite]
@@ -84,19 +79,31 @@ async def find_and_fetch_ntl(satellite:str=None, dt:datetime=None):
             all_entries = await obstore.list(store, prefix=prefix).collect_async()
             # Now filter for your timestamp 't2156'
             time_pattern = dt.strftime(f't%H%M')
-
+            if 'cloud' in product.lower():
+                time_pattern = dt.strftime(f's%Y%m%d%H%M')
             try:
-                target_file = [e for e in all_entries if time_pattern in e['path'] and e['path'].endswith('.h5')].pop()
+                target_file = [e for e in all_entries if time_pattern in e['path']].pop()
                 if not provider in found_paths:
                     found_paths[provider] = []
                 found_paths[provider].append((target_file['path'], target_file['size']))
-            except IndexError:
+            except IndexError as ie:
+                logger.error(f'{ie}. Moving on to next product')
                 pass
-        if not found_paths or len(found_paths[provider]) != 2:
+
+        if not found_paths or len(found_paths[provider]) != len(targets):
             found_paths = {}
             continue
         break
+    if len(found_paths) != 1:
+        raise Exception(f'Failed to locate NTL data in {stores}')
+    (provider, paths), = found_paths.items()
+    if len(paths) != len(targets):
+        raise Exception(f'Incorrect number of files was collected from {provider}')
 
+    return found_paths
+
+
+async def fetch_ntl(found_paths:dict[str, list]=None, satellite:str=None, dst_dir='/tmp'):
 
     # Download logic (Surgical fetch to local SSD)
     tasks = []
@@ -108,7 +115,7 @@ async def find_and_fetch_ntl(satellite:str=None, dt:datetime=None):
                         tasks.append(tg.create_task(fetch_file(
                             satellite=satellite, provider=provider,
                             path=path, size=size, progress=progress,
-                            dst_dir='/tmp'
+                            dst_dir=dst_dir
                         )))
         except ExceptionGroup as eg:
             for e in eg.exceptions:
@@ -116,4 +123,9 @@ async def find_and_fetch_ntl(satellite:str=None, dt:datetime=None):
     return [t.result() for t in tasks]
 
 
-
+async def find_and_fetch_ntl(
+        satellite:str=None, dt:datetime=None,
+        targets:list[str]= ["VIIRS-DNB-SDR", "VIIRS-DNB-GEO", "VIIRS-JRR-CloudMask"], dst_dir='/tmp'
+):
+    found_paths = await find_ntl(satellite=satellite, dt=dt, targets=targets)
+    return await fetch_ntl(found_paths=found_paths,satellite=satellite, dst_dir=dst_dir)
