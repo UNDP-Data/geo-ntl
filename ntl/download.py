@@ -4,7 +4,7 @@ import obstore
 from datetime import datetime
 from rich.progress import Progress
 import asyncio
-from ntl.orb_search import logger
+from ntl.rt.orb_search import logger
 
 # Universal config for anonymous public access
 public_config = {"skip_signature": "true"}

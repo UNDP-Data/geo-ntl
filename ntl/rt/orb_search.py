@@ -7,6 +7,9 @@ from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TaskPr
 import time
 import logging
 from typing import Iterable, Optional
+from rich.table import Table
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -97,6 +100,7 @@ class VIIRSNavigator:
         "NOAA 20": {"ref": date(2026, 4, 14), "phase": 68.0, "drift": -25.71},
         "SUOMI NPP": {"ref": date(2026, 4, 14), "phase": 68.4, "drift": -25.37}
     }
+    SATELLITES = tuple(SAT_CONFIGS.keys())
     MIN_ELEVATION_ANGLE = 20.0
 
     def __init__(self, satellite="SUOMI NPP", tle_file='/tmp/rapida.tle'):
@@ -216,6 +220,60 @@ class VIIRSNavigator:
         # Modulo solves the 'Midnight Hiccup' wrap-around automatically
         predicted = (self.cfg["phase"] + (days_delta * self.cfg["drift"])) % self.GRANULE_DUR
         return round(predicted, 1)
+
+
+    def descending_passes(self, bbox:Iterable[float]=None, target_date:date=None):
+
+        phase = self.get_phase_for_date(target_date)
+
+        # Longitude is the same for both
+        mid_lon = (bbox[0] + bbox[2]) / 2
+
+        # Latitudes: Top for the trigger, Center for the math
+        north_lat = bbox[3]
+        mid_lat = (bbox[1] + bbox[3]) / 2
+
+        # 1. NIGHT DURATION (Use Mid-Lat for 'Average' Night)
+        doy = target_date.timetuple().tm_yday
+        declination = 0.409 * math.sin(2 * math.pi * (doy - 80) / 365)
+        lat_rad = math.radians(mid_lat)
+        cos_h = -math.tan(lat_rad) * math.tan(declination)
+        night_hrs = int(round(24 - (2 * math.degrees(math.acos(max(-1.0, min(1.0, cos_h)))) / 15)))
+
+        # 2. THE ANCHOR (01:30 AM Local -> UTC)
+
+        utc_anchor = datetime.combine(target_date, dtime(1, 30)) - timedelta(hours=mid_lon / 15.0)
+
+        # 3. THE TRIGGER (Use North-Lat to find when the satellite ENTERS the box)
+        search_start = utc_anchor - timedelta(hours=night_hrs / 2)
+        passes = self.orb.get_next_passes(search_start, night_hrs, mid_lon, north_lat, 0)
+        logger.debug(f'{self.satellite} passes {len(passes)} time(s) over {list(bbox)} on {target_date:%y-%m-%d}')
+
+        for rise_time, fall_time, max_elev_time in passes:
+
+            # Direction Check
+            pos_start = self.orb.get_lonlatalt(rise_time)
+            pos_end = self.orb.get_lonlatalt(fall_time)
+
+            if pos_end[1] < pos_start[1]:  # Descending
+                look = self.orb.get_observer_look(max_elev_time, mid_lon, mid_lat, 0)
+                elevation = look[1]
+                # Check Quality against the CENTER of town
+                sat_lon, _, _ = self.orb.get_lonlatalt(max_elev_time)
+                deg_offset = abs(mid_lon - sat_lon)
+                # Physical distance in km at this latitude
+                offset_km = deg_offset * 111.32 * math.cos(math.radians(mid_lat))
+                # Anchor to Midnight UTC of the target day
+                t_midnight = datetime.combine(target_date.date(), dtime(0, 0, 0))
+                delta_seconds = (max_elev_time - t_midnight).total_seconds()
+
+                # 2. Pulse-Sync Math
+                pulse_index = math.floor((delta_seconds - phase) / self.GRANULE_DUR)
+                t_start = t_midnight + timedelta(seconds=(pulse_index * self.GRANULE_DUR) + phase)
+
+                # Format: dYYYYMMDD_tHHMMSSs
+                ststr = t_start.strftime("d%Y%m%d_t%H%M%S") + str(int(t_start.microsecond / 100000))
+                return self.satellite, t_start, ststr, round(float(offset_km), 2)
 
 
     def best_pass(self, bbox:Iterable[float]=None, target_date:date=None):
@@ -342,6 +400,20 @@ def compute_best_pass(satellite:Optional[str]=None, target_date:date=None, bbox:
 
     else:
         logger.info(f'Could not find NTL data from NOAA satellites {satellite_names} for {target_date} and {bbox} ')
+
+
+def compute_passes(satellites:Optional[Iterable[str]]=None, target_date:date=None, bbox:Iterable[float] = None):
+    satellite_names = list(VIIRSNavigator.SAT_CONFIGS.keys())
+    assert isinstance(target_date, date), f'invalid target date {target_date}'
+    satellites = satellites or satellite_names
+    results = []
+    for sat in satellites:
+        logger.debug(f'Calculating best pass for satellite {sat} on target {target_date:%Y-%m-%d} over bbox {list(bbox)}')
+        nav = VIIRSNavigator(satellite=sat)
+        result = nav.descending_passes(bbox, target_date)
+        logger.debug(f'Computed best pass for satellite {result[0]}  for target date {target_date:%Y-%m-%d} on {result[1]:%Y-%m-%d} at {result[1]:%H:%M} UTC')
+        results.append(result)
+    return results
 
 if __name__ == '__main__':
     import asyncio
