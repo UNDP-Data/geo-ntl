@@ -3,10 +3,13 @@ from affine import Affine
 import math
 import logging
 from scipy.ndimage import zoom
-import numpy as np
 import matplotlib.pyplot as plt
-
-
+import fsspec
+from typing import Iterable
+from ntl.utils.vector import bbox_to_geojson_polygon
+import concurrent
+import numpy as np
+from rich.progress import Progress
 logger = logging.getLogger(__name__)
 
 HDF_VARS = {
@@ -17,61 +20,6 @@ HDF_VARS = {
 
 }
 
-
-
-def get_ntl_indices(geo_path: str, bbox: tuple):
-    """
-    Surgically extracts BBOX indices using pure Python affine math,
-    requiring zero GDAL/Rasterio dependencies.
-    """
-    lon_min, lat_min, lon_max, lat_max = bbox
-
-    with h5py.File(geo_path, 'r') as g:
-        # Read only the corners using slices
-        lat_ds = g['All_Data/VIIRS-DNB-GEO_All/Latitude_TC']
-        lon_ds = g['All_Data/VIIRS-DNB-GEO_All/Longitude_TC']
-
-        nrows, ncols = lat_ds.shape
-
-        # Top-Left, Bottom-Right
-        tl_lat, tl_lon = lat_ds[0, 0], lon_ds[0, 0]
-        br_lat, br_lon = lat_ds[-1, -1], lon_ds[-1, -1]
-
-        # Ensure we have absolute bounds
-        g_lon_min, g_lat_min = min(tl_lon, br_lon), min(tl_lat, br_lat)
-        g_lon_max, g_lat_max = max(tl_lon, br_lon), max(tl_lat, br_lat)
-
-        # Abort if the BBOX completely missed this granule
-        if (lon_max < g_lon_min or lon_min > g_lon_max or
-                lat_max < g_lat_min or lat_min > g_lat_max):
-            return None
-
-            # 1. Construct the pure Affine Transform natively
-        # x_scale = (east - west) / width
-        # y_scale = (south - north) / height (Negative because row 0 is North)
-        x_scale = (g_lon_max - g_lon_min) / ncols
-        y_scale = (g_lat_min - g_lat_max) / nrows
-
-        # Affine(a, b, c, d, e, f) -> a=x_scale, c=west, e=y_scale, f=north
-        transform = Affine(x_scale, 0.0, g_lon_min,
-                           0.0, y_scale, g_lat_max)
-
-        # 2. Invert the transform (Lon, Lat) -> (Col, Row)
-        inv_transform = ~transform
-
-        # 3. Calculate matrix indices for Nairobi's corners
-        col_min_float, row_max_float = inv_transform * (lon_min, lat_min)  # Bottom-Left
-        col_max_float, row_min_float = inv_transform * (lon_max, lat_max)  # Top-Right
-
-        # Safely convert to integer bounds
-        row_min = max(0, math.floor(min(row_min_float, row_max_float)))
-        row_max = min(nrows - 1, math.ceil(max(row_min_float, row_max_float)))
-        col_min = max(0, math.floor(min(col_min_float, col_max_float)))
-        col_max = min(ncols - 1, math.ceil(max(col_min_float, col_max_float)))
-
-        # 5-pixel buffer for orbital projection warping
-        return (max(0, row_min - 5), min(nrows - 1, row_max + 5),
-                max(0, col_min - 5), min(ncols - 1, col_max + 5))
 
 
 def read_ntl_file(src: str = None, var_name: str = None, indices: tuple[int] = None, is_cmask: bool = False):
@@ -94,60 +42,201 @@ def read_ntl_file(src: str = None, var_name: str = None, indices: tuple[int] = N
 
     return data
 
-def get_cm_indices(cm_path: str, bbox: tuple):
+
+def get_roi_indices(roi_bbox: Iterable[float], granule_bbox: Iterable[float], granule_rows:int=None, granule_cols:int=None):
+
+    roi_lon_min, roi_lat_min, roi_lon_max, roi_lat_max = roi_bbox
+    granule_lon_min, granule_lat_min, granule_lon_max, granule_lat_max = granule_bbox
+
+
+
+    # Ensure we have absolute bounds
+    g_lon_min, g_lat_min = min(granule_lon_max, granule_lon_min), min(granule_lat_max, granule_lat_min)
+    g_lon_max, g_lat_max = max(granule_lon_max, granule_lon_min), max(granule_lat_max, granule_lat_min)
+
+    # Abort if the BBOX completely missed this granule
+    if (roi_lon_max < g_lon_min or roi_lon_min > g_lon_max or
+            roi_lat_max < g_lat_min or roi_lat_min > g_lat_max):
+        return None
+
+        # 1. Construct the pure Affine Transform natively
+    # x_scale = (east - west) / width
+    # y_scale = (south - north) / height (Negative because row 0 is North)
+    x_scale = (g_lon_max - g_lon_min) / granule_cols
+    y_scale = (g_lat_min - g_lat_max) / granule_rows
+
+    # Affine(a, b, c, d, e, f) -> a=x_scale, c=west, e=y_scale, f=north
+    transform = Affine(x_scale, 0.0, g_lon_min,
+                       0.0, y_scale, g_lat_max)
+
+    # 2. Invert the transform (Lon, Lat) -> (Col, Row)
+    inv_transform = ~transform
+
+    # 3. Calculate matrix indices for Nairobi's corners
+    col_min_float, row_max_float = inv_transform * (roi_lon_min, roi_lat_min)  # Bottom-Left
+    col_max_float, row_min_float = inv_transform * (roi_lon_max, roi_lat_max)  # Top-Right
+
+    # Safely convert to integer bounds
+    row_min = max(0, math.floor(min(row_min_float, row_max_float)))
+    row_max = min(granule_rows - 1, math.ceil(max(row_min_float, row_max_float)))
+    col_min = max(0, math.floor(min(col_min_float, col_max_float)))
+    col_max = min(granule_cols - 1, math.ceil(max(col_min_float, col_max_float)))
+
+    # 5-pixel buffer for orbital projection warping
+    return (max(0, row_min - 5), min(granule_rows - 1, row_max + 5),
+            max(0, col_min - 5), min(granule_cols - 1, col_max + 5))
+
+
+def indices_for_bbox(src_hdf:str=None, bbox: Iterable[float]=None,
+                     lon_var_name:str=None, lat_var_name:str=None):
     """
     Surgically extracts BBOX indices using pure Python affine math,
     requiring zero GDAL/Rasterio dependencies.
     """
-    lon_min, lat_min, lon_max, lat_max = bbox
 
-    with h5py.File(cm_path, 'r') as g:
+
+    with h5py.File(src_hdf, 'r') as hfile:
         # Read only the corners using slices
-        lat_ds = g['Latitude']
-        lon_ds = g['Longitude']
+        lat_ds = hfile[lat_var_name]
+        lon_ds = hfile[lon_var_name]
 
-        nrows, ncols = lat_ds.shape
+        granule_rows, granule_cols = lat_ds.shape
 
         # Top-Left, Bottom-Right
-        tl_lat, tl_lon = lat_ds[0, 0], lon_ds[0, 0]
-        br_lat, br_lon = lat_ds[-1, -1], lon_ds[-1, -1]
+        granule_lat_max, granule_lon_min = lat_ds[0, 0], lon_ds[0, 0]
+        granule_lat_min, granule_lon_max = lat_ds[-1, -1], lon_ds[-1, -1]
 
-        # Ensure we have absolute bounds
-        g_lon_min, g_lat_min = min(tl_lon, br_lon), min(tl_lat, br_lat)
-        g_lon_max, g_lat_max = max(tl_lon, br_lon), max(tl_lat, br_lat)
+        return get_roi_indices(roi_bbox=bbox,
+                               granule_bbox=(granule_lon_min, granule_lat_min,granule_lon_max, granule_lat_max),
+                               granule_rows=granule_rows, granule_cols=granule_cols
+                               )
 
-        # Abort if the BBOX completely missed this granule
-        if (lon_max < g_lon_min or lon_min > g_lon_max or
-                lat_max < g_lat_min or lat_min > g_lat_max):
-            return None
 
-            # 1. Construct the pure Affine Transform natively
-        # x_scale = (east - west) / width
-        # y_scale = (south - north) / height (Negative because row 0 is North)
-        x_scale = (g_lon_max - g_lon_min) / ncols
-        y_scale = (g_lat_min - g_lat_max) / nrows
 
-        # Affine(a, b, c, d, e, f) -> a=x_scale, c=west, e=y_scale, f=north
-        transform = Affine(x_scale, 0.0, g_lon_min,
-                           0.0, y_scale, g_lat_max)
+def read_hdf_remotely(hdf_url:str=None, bbox: Iterable[float]=None,
+                     lon_var:str=None, lat_var:str=None, var_to_read:str=None):
+    fs = fsspec.filesystem("http")
+    with fs.open(hdf_url, block_size=1024 * 1024) as f:
+        with h5py.File(f, "r") as hfile:
+            # Read only the corners using slices
+            lat_ds = hfile[lat_var]
+            lon_ds = hfile[lon_var]
 
-        # 2. Invert the transform (Lon, Lat) -> (Col, Row)
-        inv_transform = ~transform
+            granule_rows, granule_cols = lat_ds.shape
 
-        # 3. Calculate matrix indices for Nairobi's corners
-        col_min_float, row_max_float = inv_transform * (lon_min, lat_min)  # Bottom-Left
-        col_max_float, row_min_float = inv_transform * (lon_max, lat_max)  # Top-Right
+            # Top-Left, Bottom-Right
+            granule_lat_max, granule_lon_min = lat_ds[0, 0], lon_ds[0, 0]
+            granule_lat_min, granule_lon_max = lat_ds[-1, -1], lon_ds[-1, -1]
 
-        # Safely convert to integer bounds
-        row_min = max(0, math.floor(min(row_min_float, row_max_float)))
-        row_max = min(nrows - 1, math.ceil(max(row_min_float, row_max_float)))
-        col_min = max(0, math.floor(min(col_min_float, col_max_float)))
-        col_max = min(ncols - 1, math.ceil(max(col_min_float, col_max_float)))
+            rmin, rmax, cmin, cmax = get_roi_indices(roi_bbox=bbox,
+                                   granule_bbox=(granule_lon_min, granule_lat_min, granule_lon_max, granule_lat_max),
+                                   granule_rows=granule_rows, granule_cols=granule_cols
+                                   )
+            return hfile[var_to_read][rmin:rmax, cmin:cmax]
 
-        # 5-pixel buffer for orbital projection warping
-        return (max(0, row_min - 5), min(nrows - 1, row_max + 5),
-                max(0, col_min - 5), min(ncols - 1, col_max + 5))
+def indices_for_bbox_remotely(hdf_url:str=None, bbox: Iterable[float]=None,
+                     lon_var_name:str=None, lat_var_name:str=None):
+    fs = fsspec.filesystem("http")
+    with fs.open(hdf_url, block_size=1024 * 1024) as f:
+        with h5py.File(f, "r") as hfile:
+            # Read only the corners using slices
+            lat_ds = hfile[lat_var_name]
+            lon_ds = hfile[lon_var_name]
 
+            granule_rows, granule_cols = lat_ds.shape
+
+            # Top-Left, Bottom-Right
+            granule_lat_max, granule_lon_min = lat_ds[0, 0], lon_ds[0, 0]
+            granule_lat_min, granule_lon_max = lat_ds[-1, -1], lon_ds[-1, -1]
+
+            return get_roi_indices(roi_bbox=bbox,
+                                   granule_bbox=(granule_lon_min, granule_lat_min, granule_lon_max, granule_lat_max),
+                                   granule_rows=granule_rows, granule_cols=granule_cols
+                                   )
+
+
+def cloud_coverage(hdf_url: str, bbox: Iterable[float],
+                   lon_var: str = 'Longitude', lat_var: str = 'Latitude',
+                   var_to_read: str = 'CloudMaskBinary', progress: Progress = None):
+    roi_lon_min, roi_lat_min, roi_lon_max, roi_lat_max = bbox
+    fs = fsspec.filesystem("http")
+
+    filename = hdf_url.split('/')[-1][:25] + "..."
+    task = None
+    if progress:
+        # Initialize the worker task
+        task = progress.add_task(f"[cyan]{filename}: Connecting...", total=4)
+
+    try:
+        with fs.open(hdf_url, block_size=1024 * 1024) as f:
+            with h5py.File(f, "r") as hfile:
+
+
+                lats = hfile[lat_var][:]
+                if progress and task:
+                    progress.update(task, description=f"[cyan]Downloading latitudes...",advance=1)
+                lons = hfile[lon_var][:]
+                if progress and task:
+                    progress.update(task, description=f"[cyan]Downloading longitudes...", advance=1)
+
+
+                valid_pixels = (
+                        (lats >= roi_lat_min) & (lats <= roi_lat_max) &
+                        (lons >= roi_lon_min) & (lons <= roi_lon_max)
+                )
+                if progress and task:
+                    progress.update(task, description=f"[cyan]computing valid coordinates...", advance=1)
+
+                if not np.any(valid_pixels):
+                    # Use rich's print to keep it safe from the live display
+                    progress.console.print(f"[yellow]⚠️ {filename} missed BBOX.[/]")
+                    return None
+
+                rows, cols = np.where(valid_pixels)
+                rmin, rmax = rows.min(), rows.max()
+                cmin, cmax = cols.min(), cols.max()
+
+                rmin, rmax = max(0, rmin), min(lats.shape[0] - 1, rmax)
+                cmin, cmax = max(0, cmin), min(lons.shape[1] - 1, cmax)
+                progress.update(task, advance=1)
+
+                progress.update(task, description=f"[cyan]{filename}: Extracting Mask...")
+                data_crop = hfile[var_to_read][rmin:rmax, cmin:cmax]
+                progress.update(task, advance=1)
+
+                if data_crop.size == 0:
+                    return None
+
+                return int(data_crop[data_crop == 1].size / data_crop.size * 100)
+    finally:
+        progress.remove_task(task)
+
+
+
+def cloud_coverage_batch(urls: list[str], bbox: Iterable[float], max_threads: int = 5, progress=None):
+    results = {}
+    print(len(urls))
+    if progress is not None:
+        master_task = progress.add_task(description="[green]Computing cloud cover...", total=len(urls))
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_threads) as executor:
+        future_to_url = {
+            executor.submit(cloud_coverage, hdf_url=url, bbox=bbox, progress=progress): url
+            for url in urls
+        }
+
+        for future in concurrent.futures.as_completed(future_to_url):
+            url = future_to_url[future]
+            try:
+                coverage = future.result()
+                results[url] = coverage
+            except Exception as exc:
+                progress.console.print(f"[red]Error reading {url}: {exc}[/]")
+                results[url] = None
+            finally:
+                progress.update(master_task, advance=1)
+
+    return results
 
 
 
@@ -162,18 +251,50 @@ def plot(array):
 
     # imshow is perfect for 2D spatial arrays
     # 'magma' or 'inferno' are great colormaps for night lights
-    img = plt.imshow(array, cmap='magma')
+    img = plt.imshow(array, cmap='magma', interpolation='nearest')
 
     plt.colorbar(img, label='Log Radiance (NanoWatts)')
     plt.title("Nairobi Night Lights - Zero Drama Edition")
 
     plt.show()
+if __name__ == '__main__':
+    from datetime import datetime
+    import asyncio
+    import json
+    # --- Clean Execution ---
+    nairobi_bbox = (36.5, -2, 37.5, -0.7)
 
-from datetime import datetime
-import asyncio
-# --- Clean Execution ---
-nairobi_bbox = (36.6, -2, 37.2, -1)
-target_date = datetime(2026, 4, 17)
-sdr_path = '/data/NTL/nairobi/SVDNB_j02_d20260416_t2301309_e2302556_b17786_c20260416233740293000_oebc_ops.h5'
-geo_path = '/data/NTL/nairobi/GDNBO_j02_d20260416_t2301309_e2302556_b17786_c20260416233511658000_oebc_ops.h5'
-cm_path = '/data/NTL/nairobi/JRR-CloudMask_v3r2_n21_s202604162301309_e202604162302556_c202604162344501.nc'
+    geojson = bbox_to_geojson_polygon(*nairobi_bbox)
+    with open("/tmp/nairobi.geojson", "w") as f:
+        json.dump(geojson, f)
+
+    target_date = datetime(2026, 4, 17)
+    sdr_path = '/data/NTL/nairobi/SVDNB_j02_d20260416_t2301309_e2302556_b17786_c20260416233740293000_oebc_ops.h5'
+    geo_path = '/data/NTL/nairobi/GDNBO_j02_d20260416_t2301309_e2302556_b17786_c20260416233511658000_oebc_ops.h5'
+    cm_path = '/data/NTL/nairobi/JRR-CloudMask_v3r2_n21_s202604162301309_e202604162302556_c202604162344501.nc'
+    cm_remote = 'https://noaa-nesdis-n21-pds.s3.amazonaws.com/VIIRS-JRR-CloudMask/2026/04/16/JRR-CloudMask_v3r2_n21_s202604162301309_e202604162302556_c202604162344501.nc'
+    cm_r = 'https://storage.googleapis.com/gcp-noaa-nesdis-n21/VIIRS-JRR-CloudMask/2026/04/16/JRR-CloudMask_v3r2_n21_s202604162301309_e202604162302556_c202604162344501.nc'
+    # ind = indices_for_bbox(src_hdf=cm_path, bbox=nairobi_bbox, lon_var_name='Longitude', lat_var_name='Latitude')
+    # print(ind)
+    #
+    # ind1 = indices_for_bbox_remotely(hdf_url=cm_remote, bbox=nairobi_bbox,lon_var_name='Longitude', lat_var_name='Latitude')
+    # print(ind1)
+    # ind2 = indices_for_bbox(src_hdf=geo_path, bbox=nairobi_bbox,
+    #                         lon_var_name='All_Data/VIIRS-DNB-GEO_All/Longitude_TC',
+    #                         lat_var_name='All_Data/VIIRS-DNB-GEO_All/Latitude_TC')
+    # print(ind2)
+    # cm = read_hdf_remotely(hdf_url=cm_remote, bbox=nairobi_bbox,
+    #                        lon_var='Longitude', lat_var='Latitude', var_to_read=HDF_VARS['CLOUD_MASK'])
+    #
+    # plot(cm)
+
+    cm1 = cloud_coverage(hdf_url=cm_remote, bbox=nairobi_bbox,
+                         lon_var='Longitude', lat_var='Latitude', var_to_read=HDF_VARS['CLOUD_MASK'])
+
+    print(cm1)
+
+    # cm1 = read_ntl_file(src=cm_path,var_name=HDF_VARS['CLOUD_MASK'], indices=ind,is_cmask=True)
+    #
+    # plot(cm1)
+
+

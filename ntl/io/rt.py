@@ -4,24 +4,42 @@ import obstore
 from datetime import datetime
 from rich.progress import Progress
 import asyncio
-from ntl.rt.orb_search import logger
-
+import re
+from typing import Iterable
+from urllib.parse import urlparse
 # Universal config for anonymous public access
 public_config = {"skip_signature": "true"}
 import logging
 logger = logging.getLogger(__name__)
 
+PRODUCTS_RE = {
+    'CM': re.compile(r'^(?P<product>[\w-]+)_(?P<version>v\d+r\d+)_(?P<platform>\w+)_s(?P<start>\d+)_e(?P<end>\d+)_c(?P<creation>\d+)\.(?P<ext>\w+)$'),
+    'GEO': re.compile(r'^(?P<product>[^_]+)_(?P<platform>[^_]+)_d(?P<date>\d{8})_t(?P<start>\d+)_e(?P<end>\d+)_b(?P<orbit>\d+)_c(?P<creation>\d+)_(?P<facility>[^_]+)_(?P<env>[^_]+)\.(?P<ext>\w+)$'),
+    'SDR': re.compile(r'^(?P<product>[^_]+)_(?P<platform>[^_]+)_d(?P<date>\d{8})_t(?P<start>\d+)_e(?P<end>\d+)_b(?P<orbit>\d+)_c(?P<creation>\d+)_(?P<facility>[^_]+)_(?P<env>[^_]+)\.(?P<ext>\w+)$')
+}
+
+
+PRODUCTS={
+    'SDR':"VIIRS-DNB-SDR",
+    'GEO':"VIIRS-DNB-GEO",
+    'CM':"VIIRS-JRR-CloudMask"
+}
+
+
+PRODUCT_NAMES = tuple(PRODUCTS)
+SOURCES = dict(aws='aws', gcp='gcp')
+SOURCE_NAMES=tuple(SOURCES)
 # Define the base URLs for the three VIIRS satellites
 viirs_urls = {
-    "SUOMI NPP": {
+    "SNPP": {
         "aws": "s3://noaa-nesdis-snpp-pds/",
         "gcp": "gs://gcp-noaa-nesdis-snpp/"
     },
-    "NOAA 20": {
+    "N20": {
         "aws": "s3://noaa-nesdis-n20-pds/",
         "gcp": "gs://gcp-noaa-nesdis-n20/"
     },
-    "NOAA 21": {
+    "N21": {
         "aws": "s3://noaa-nesdis-n21-pds/",
         "gcp": "gs://gcp-noaa-nesdis-n21/"
     }
@@ -30,11 +48,22 @@ viirs_urls = {
 # The "Solid" way: Generate stores using from_url
 viirs_stores = {
     sat: {
-        provider: obstore.store.from_url(url, config=public_config)
-        for provider, url in providers.items()
+        source: obstore.store.from_url(url, config=public_config)
+        for source, url in sources.items()
     }
-    for sat, providers in viirs_urls.items()
+    for sat, sources in viirs_urls.items()
 }
+
+
+def public_url(file_path:str=None, satellite:str=None, source:str=None):
+
+    public_cloud_url = viirs_urls[satellite][source]
+    parsed_public_url = urlparse(public_cloud_url)
+    bucket = parsed_public_url.netloc
+    if parsed_public_url.scheme == 's3':
+        return f'https://{bucket}.s3.amazonaws.com/{file_path}'
+    if parsed_public_url.scheme == 'gs':
+        return f'https://storage.googleapis.com/{bucket}/{file_path}'
 
 
 async def fetch_file(satellite:str=None, provider:str=None, path:str=None, size:int=None, dst_dir:str=None, progress=None):
@@ -65,16 +94,17 @@ async def fetch_file(satellite:str=None, provider:str=None, path:str=None, size:
 
 
 async def find_ntl(satellite:str=None, dt:datetime=None,
-        targets:list[str]= ["VIIRS-DNB-SDR", "VIIRS-DNB-GEO", "VIIRS-JRR-CloudMask"]):
-    found_paths = {}
-    # Usage:
+        products:Iterable[str]=PRODUCT_NAMES, source:str=None ):
+    found = {}
     stores = viirs_stores[satellite]
-
     date_path = dt.strftime(f'/%Y/%m/%d/')
+    if source:
+        stores = {source: stores[source]}
 
-    for provider, store in stores.items():
+    for source, store in stores.items():
 
-        for product in targets:
+        for product_name in products:
+            product = PRODUCTS[product_name]
             prefix = f"{product}/{date_path}/"
             all_entries = await obstore.list(store, prefix=prefix).collect_async()
             # Now filter for your timestamp 't2156'
@@ -82,30 +112,31 @@ async def find_ntl(satellite:str=None, dt:datetime=None,
             if 'cloud' in product.lower():
                 time_pattern = dt.strftime(f's%Y%m%d%H%M')
             try:
-                target_file = [e for e in all_entries if time_pattern in e['path']].pop()
-                if not provider in found_paths:
-                    found_paths[provider] = []
-                found_paths[provider].append((target_file['path'], target_file['size']))
-            except IndexError as ie:
-                logger.error(f'{ie}. Moving on to next product')
-                pass
 
-        if not found_paths or len(found_paths[provider]) != len(targets):
-            found_paths = {}
+                target_file = [e for e in all_entries if time_pattern in e['path'] and (e['path'].endswith('.nc') or e['path'].endswith('.h5'))].pop()
+                if not source in found:
+                    found[source] = []
+                found[source].append((target_file['path'], target_file['size']))
+            except IndexError as ie:
+                logger.info(f'No exact match was detected for {satellite} {time_pattern}. Switching to +-1 range.')
+                continue
+
+        if not found or len(found[source]) != len(products):
+            found = {}
             continue
         break
-    if len(found_paths) != 1:
-        raise Exception(f'Failed to locate NTL data in {stores}')
-    (provider, paths), = found_paths.items()
-    if len(paths) != len(targets):
-        raise Exception(f'Incorrect number of files was collected from {provider}')
+    if len(found) != 1:
+        raise Exception(f'Failed to locate NTL data in {stores} {found}')
+    (source, paths), = found.items()
+    if len(paths) != len(products):
+        raise Exception(f'Incorrect number of files was collected from {source}')
 
-    return found_paths
+    return found
 
 
 async def fetch_ntl(found_paths:dict[str, list]=None, satellite:str=None, dst_dir='/tmp'):
 
-    # Download logic (Surgical fetch to local SSD)
+    # Download logic (Surgical io to local SSD)
     tasks = []
     with Progress(disable=False, console=None, transient=False) as progress:
         try:
@@ -125,7 +156,7 @@ async def fetch_ntl(found_paths:dict[str, list]=None, satellite:str=None, dst_di
 
 async def find_and_fetch_ntl(
         satellite:str=None, dt:datetime=None,
-        targets:list[str]= ["VIIRS-DNB-SDR", "VIIRS-DNB-GEO", "VIIRS-JRR-CloudMask"], dst_dir='/tmp'
+        products:Iterable[str]=PRODUCT_NAMES, dst_dir='/tmp'
 ):
-    found_paths = await find_ntl(satellite=satellite, dt=dt, targets=targets)
+    found_paths = await find_ntl(satellite=satellite, dt=dt, products=products)
     return await fetch_ntl(found_paths=found_paths,satellite=satellite, dst_dir=dst_dir)
