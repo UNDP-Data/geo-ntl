@@ -1,6 +1,8 @@
 """
 Search for VIIRS satellites passes using pyrobital and TLE
 """
+import os.path
+
 import numpy as np
 from pyorbital.orbital import Orbital
 from datetime import datetime, timedelta, date, time as dtime
@@ -15,8 +17,8 @@ from typing import Iterable, Optional
 from ntl.io import rt
 import asyncio
 from enum import Enum
-from ntl.cmask import cloud_coverage, cloud_coverage_batch
-from ntl.io.rt import public_url
+from ntl.cmask import cloud_coverage_batch
+from ntl.io.rt import public_url, PRODUCTS_RE, parse_noaa_timestamp
 
 logger = logging.getLogger(__name__)
 
@@ -274,7 +276,7 @@ class VIIRSNavigator:
             tfile.write(tle_content)
         return cache_file
 
-    def get_phase_for_date_old(self, target_date):
+    def get_phase_for_date_1(self, target_date):
         """Calculates the 100% offline phase for any day."""
         days_delta = (target_date.date() - self.cfg["ref"]).days
 
@@ -283,7 +285,7 @@ class VIIRSNavigator:
         predicted = (self.cfg["phase"] + (days_delta * self.cfg["drift"])) % self.GRANULE_DUR
         return predicted
 
-    def get_phase_for_date(self, target_date):
+    def get_phase_for_date_2(self, target_date):
         """Calculates exact phase using the continuous spacecraft clock."""
 
         # 1. Handle both 'date' and 'datetime' inputs safely
@@ -300,6 +302,24 @@ class VIIRSNavigator:
         # 4. Predict phase using exact modulo arithmetic
         # Python's modulo perfectly handles negative time shifts
         predicted = (self.cfg["phase"] + delta_seconds) % self.GRANULE_DUR
+
+        return predicted
+
+    def get_phase_for_date(self, target_date):
+        """Calculates exact phase using the continuous spacecraft clock and physical drift."""
+        if isinstance(target_date, datetime):
+            target_date = target_date.date()
+
+        target_midnight = datetime.combine(target_date, dtime(0, 0, 0))
+        ref_midnight = datetime.combine(self.cfg["ref"], dtime(0, 0, 0))
+        delta_seconds = (target_midnight - ref_midnight).total_seconds()
+
+        # FIXED MATH: Apply the daily drift rate to the exact seconds elapsed
+        drift_per_second = self.cfg["drift"] / 86400.0
+        accumulated_drift = delta_seconds * drift_per_second
+
+        # Add the accumulated drift, NOT the raw delta_seconds
+        predicted = (self.cfg["phase"] + accumulated_drift) % self.GRANULE_DUR
 
         return predicted
 
@@ -380,21 +400,34 @@ class VIIRSNavigator:
                 logger.debug(f'Skipping {p} because of low elevation angle {elevation:0f}')
                 continue
             granule = self.pass2granule(p=p,midlon=midlon, midlat=midlat, elevation=elevation)
+            found = asyncio.run(
+                rt.find_ntl(
+                    satellite=self.satellite,
+                    dt=granule.start_time,
+                    products=['CM']  # , dst_dir='/tmp'
+                )
+            )
+
+            if found:
+                time_pattern = granule.start_time.strftime(f's%Y%m%d%H%M')
+                (source, entry), = found.items()
+                cm_file_path, _ = entry[0]
+                rex = PRODUCTS_RE['CM']
+                _, fname = os.path.split(cm_file_path)
+                if not time_pattern in fname:
+                    m = rex.match(fname)
+                    if m:
+                        parts = m.groupdict()
+                        starts = parts['start']
+                        start_time = parse_noaa_timestamp(starts)
+                        granule.start_time = start_time
+
             if strategy != SearchMode.ALL:
-                found = asyncio.run(
-                            rt.find_ntl(
-                                satellite=self.satellite,
-                                dt=granule.start_time,
-                                products=['CM']#, dst_dir='/tmp'
-                            )
-                        )
-                if found:
-                    (source, entry), = found.items()
-                    cm_file_path, _ = entry[0]
                     public_cm_url = public_url(file_path=cm_file_path,satellite=self.satellite, source=source)
                     granules[public_cm_url] = p,granule
-                else:
-                    logger.info(f'Failed to find cloud coverage file for granule {granule}')
+
+            else:
+                granules[p] = granule
 
         return granules
 
@@ -567,18 +600,26 @@ def search_granules(satellites:Optional[Iterable[str]]=None, target_date:date=No
     granules = []
     granules_pasess = {}
     for sat in satellites:
+        logger.info(f'Locating imaghery (data granules) for {sat} satellite')
         nav = VIIRSNavigator(satellite=sat)
         sat_granules = nav.night_granules(bbox=bbox, target_date=target_date, strategy=strategy)
         granules_pasess.update(sat_granules)
 
-    cloud_coverage_results = cloud_coverage_batch(urls=list(granules_pasess.keys()), bbox=bbox, progress=progress)
-    for cm_url, e in granules_pasess.items():
-        p, g = e
-        g.cloud_cover = cloud_coverage_results[cm_url]
-        granules.append(g)
+    if strategy != SearchMode.ALL:
+        cloud_coverage_results = cloud_coverage_batch(urls=list(granules_pasess.keys()), bbox=bbox, progress=progress)
+        for cm_url, e in granules_pasess.items():
+            p, g = e
+            g.cloud_cover = cloud_coverage_results[cm_url]
+            granules.append(g)
+        granules.sort(key=lambda g: g.rank, reverse=True)
 
-    granules.sort(key=lambda g: g.rank, reverse=True)
-    return granules
+        if strategy == SearchMode.CMASK:
+            return granules[-1:]
+        return granules
+    else:
+        granules = list(granules_pasess.values())
+        granules.sort(key=lambda g: g.rank, reverse=True)
+        return granules
 
 if __name__ == '__main__':
     import asyncio

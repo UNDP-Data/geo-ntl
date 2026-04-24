@@ -1,7 +1,7 @@
 import os.path
 import aiofiles
 import obstore
-from datetime import datetime
+from datetime import datetime, timedelta
 from rich.progress import Progress
 import asyncio
 import re
@@ -54,6 +54,18 @@ viirs_stores = {
     for sat, sources in viirs_urls.items()
 }
 
+
+def parse_noaa_timestamp(time_str: str) -> datetime:
+    """
+    Converts a NOAA VIIRS string (e.g., '202604010001018') into a timezone-naive UTC datetime.
+    """
+    # The first 14 characters: YYYYMMDDHHMMSS
+    base_time = datetime.strptime(time_str[:14], "%Y%m%d%H%M%S")
+
+    # The 15th character: tenths of a second (1 tenth = 100,000 microseconds)
+    tenths = int(time_str[14:])
+
+    return base_time + timedelta(microseconds=tenths * 100000)
 
 def public_url(file_path:str=None, satellite:str=None, source:str=None):
 
@@ -112,13 +124,25 @@ async def find_ntl(satellite:str=None, dt:datetime=None,
             if 'cloud' in product.lower():
                 time_pattern = dt.strftime(f's%Y%m%d%H%M')
             try:
-
-                target_file = [e for e in all_entries if time_pattern in e['path'] and (e['path'].endswith('.nc') or e['path'].endswith('.h5'))].pop()
                 if not source in found:
                     found[source] = []
+                target_file = [e for e in all_entries if time_pattern in e['path'] and (e['path'].endswith('.nc') or e['path'].endswith('.h5'))].pop()
+
                 found[source].append((target_file['path'], target_file['size']))
             except IndexError as ie:
-                logger.info(f'No exact match was detected for {satellite} {time_pattern}. Switching to +-1 range.')
+                logger.info(f'No exact match was detected for satellite {satellite} timestamp {time_pattern} on {store}. Considering neighbors.')
+                rex = PRODUCTS_RE[product_name]
+                for e in all_entries:
+                    rel_path, fname = os.path.split(e['path'])
+                    m = rex.match(fname)
+                    if m:
+                        file_vars = m.groupdict()
+                        starts, ends = file_vars['start'], file_vars['end']
+                        startt, endt = parse_noaa_timestamp(starts), parse_noaa_timestamp(ends)
+                        if dt.minute//10 == startt.minute//10:
+                            if startt <= dt <= endt:
+                                found[source].append((e['path'], e['size']))
+
                 continue
 
         if not found or len(found[source]) != len(products):

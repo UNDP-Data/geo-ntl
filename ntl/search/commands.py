@@ -104,33 +104,28 @@ def search(state, satellites, target_date, bbox, strategy):
 
 
     table = Table(title=f"VIIRS satellites granules on {target_date.date()} covering {bbox}", title_style="bold yellow")
+    table.add_column("Rank", justify="center", style="white")
     table.add_column("Satellite", style="green", justify='center')
     table.add_column("Granule ID (Timestamp)", style="cyan", justify='center')
     #table.add_column("Scan Start Date and Time (UTC)", style="red", justify='center')
     table.add_column("Bbox offset from SSP (km)", justify="center", style="white" )
     table.add_column("Elevation above bbox (degrees)", justify="center", style="white" )
-    table.add_column("Cloud coverage in bbox (%)", justify="center", style="white")
-    table.add_column("Sat rank (%)", justify="center", style="white")
-    table.add_column("Rank (%)", justify="center", style="white")
+    if strategy != SearchMode.ALL:
+        table.add_column("Cloud coverage in bbox (%)", justify="center", style="white")
+    table.add_column("Score (%)", justify="center", style="white")
     # with state.console.status("[bold blue]Calculating granule temporal anchors..."):
     with Progress(disable=False, console=state.console) as progress:
-        granules = search_granules(satellites=satellites, target_date=target_date,bbox=bbox, strategy=strategy,
-                                   progress=progress)
-
+        progress.console.status("[bold blue]Calculating granule temporal anchors...")
+        granules = search_granules(
+            satellites=satellites, target_date=target_date,bbox=bbox,
+            strategy=strategy,progress=progress)
         if granules:
-            for granule in granules:
-                table.add_row(
-                    granule.sat,
-                    granule.id,
-                    #granule.start_time.strftime("%Y-%m-%d %H:%M:%S.%f")[:-5],
-                    str(granule.offset),
-                    f'{granule.elevation:.2f}',
-                    f'{granule.cloud_cover}',
-                    f'{granule.sat_rank}',
-                    f'{granule.rank}'
-                )
-
-
+            for i, granule in enumerate(granules, start=1):
+                if strategy != SearchMode.ALL:
+                    values = f'{i}',granule.sat,granule.id,f'{granule.offset}', f'{granule.elevation:.2f}', f'{granule.cloud_cover}',f'{granule.rank}'
+                else:
+                    values = f'{i}', granule.sat, granule.id, f'{granule.offset}', f'{granule.elevation:.2f}', f'{granule.rank}'
+                table.add_row(*values)
 
 
     if table.row_count == 0:

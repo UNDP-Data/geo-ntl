@@ -164,28 +164,31 @@ def cloud_coverage(hdf_url: str, bbox: Iterable[float],
     filename = hdf_url.split('/')[-1][:25] + "..."
     task = None
     if progress:
-        # Initialize the worker task
-        task = progress.add_task(f"[cyan]{filename}: Connecting...", total=4)
+        task = progress.add_task(description=f"[cyan]Computing cloud coverage for {filename}", total=3)
 
     try:
         with fs.open(hdf_url, block_size=1024 * 1024) as f:
             with h5py.File(f, "r") as hfile:
 
-
+                if progress and task is not None:
+                    progress.update(task, description=f'[cyan] Downloading latitude coordinates')
                 lats = hfile[lat_var][:]
-                if progress and task:
-                    progress.update(task, description=f"[cyan]Downloading latitudes...",advance=1)
+                if progress and task is not None:
+                    progress.update(task, advance=1)
+
+
+                if progress and task is not None:
+                    progress.update(task, description=f'[cyan] Downloading longitude coordinates')
                 lons = hfile[lon_var][:]
-                if progress and task:
-                    progress.update(task, description=f"[cyan]Downloading longitudes...", advance=1)
+                if progress and task is not None:
+                    progress.update(task, advance=1)
 
 
                 valid_pixels = (
                         (lats >= roi_lat_min) & (lats <= roi_lat_max) &
                         (lons >= roi_lon_min) & (lons <= roi_lon_max)
                 )
-                if progress and task:
-                    progress.update(task, description=f"[cyan]computing valid coordinates...", advance=1)
+
 
                 if not np.any(valid_pixels):
                     # Use rich's print to keep it safe from the live display
@@ -198,47 +201,55 @@ def cloud_coverage(hdf_url: str, bbox: Iterable[float],
 
                 rmin, rmax = max(0, rmin), min(lats.shape[0] - 1, rmax)
                 cmin, cmax = max(0, cmin), min(lons.shape[1] - 1, cmax)
-                progress.update(task, advance=1)
 
-                progress.update(task, description=f"[cyan]{filename}: Extracting Mask...")
+                if progress and task is not None:
+                    progress.update(task, description=f'[cyan] Downloading cloud mask')
                 data_crop = hfile[var_to_read][rmin:rmax, cmin:cmax]
-                progress.update(task, advance=1)
+                if progress and task is not None:
+                    progress.update(task, advance=1)
 
                 if data_crop.size == 0:
                     return None
 
                 return int(data_crop[data_crop == 1].size / data_crop.size * 100)
     finally:
-        progress.remove_task(task)
+        if progress and task is not None:
+            progress.remove_task(task)
 
 
 
-def cloud_coverage_batch(urls: list[str], bbox: Iterable[float], max_threads: int = 5, progress=None):
+def cloud_coverage_batch(urls: list[str], bbox: Iterable[float], max_threads: int = 5, progress:Progress=None):
     results = {}
-    print(len(urls))
-    if progress is not None:
-        master_task = progress.add_task(description="[green]Computing cloud cover...", total=len(urls))
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_threads) as executor:
-        future_to_url = {
-            executor.submit(cloud_coverage, hdf_url=url, bbox=bbox, progress=progress): url
-            for url in urls
-        }
+    try:
 
-        for future in concurrent.futures.as_completed(future_to_url):
-            url = future_to_url[future]
-            try:
-                coverage = future.result()
-                results[url] = coverage
-            except Exception as exc:
-                progress.console.print(f"[red]Error reading {url}: {exc}[/]")
-                results[url] = None
-            finally:
-                progress.update(master_task, advance=1)
+        if progress is not None:
+            master_task = progress.add_task(description="[green]Computing cloud cover...", total=len(urls))
 
-    return results
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_threads) as executor:
+            future_to_url = {
+                executor.submit(cloud_coverage, hdf_url=url, bbox=bbox, progress=progress): url
+                for url in urls
+            }
 
+            for future in concurrent.futures.as_completed(future_to_url):
+                url = future_to_url[future]
+                try:
+                    coverage = future.result()
+                    results[url] = coverage
+                except Exception as exc:
+                    progress.console.print(f"[red]Error reading {url}: {exc}[/]")
+                    results[url] = None
+                finally:
+                    progress.update(master_task, advance=1)
 
+        return results
+    except KeyboardInterrupt:
+        progress.console.print('^C was pressed. Cancelling')
+        raise
+    finally:
+        if progress and master_task is not None:
+            progress.remove_task(master_task)
 
 def plot(array):
     # 1. Convert to NanoWatts and clean (The magic fix for satellite data)
