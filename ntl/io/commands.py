@@ -1,4 +1,4 @@
-import os.path
+from rich.table import Table
 import click
 from typing import Iterable
 from .rt import locate_file, fetch_ntl
@@ -6,8 +6,7 @@ from ntl.search.orbital import  VIIRSNavigator
 from ntl.io.rt import PRODUCT_NAMES, SOURCE_NAMES
 from rich.progress import Progress
 from datetime import datetime
-
-
+from ntl.io import bytesto
 
 @click.command(no_args_is_help=True)
 @click.option(
@@ -51,11 +50,23 @@ from datetime import datetime
 
 @click.pass_obj
 async def download(state, satellite:str=None, timestamp:str=None, products:Iterable[str]=None, source:str=None, dest_dir:str=None):
-    """Download """
+    """Download VIIRS imagery for a satellite and a timestamp ..."""
+    table = Table(title=f"VIIRS satellites images for the night of  {timestamp} ",
+                  title_style="bold yellow")
 
-    with Progress(disable=False, console=state.console) as progress:
+    table.add_column("Satellite", style="green", justify='center')
+    table.add_column("Timestamp (UTC)", style="cyan", justify='center')
+    table.add_column("Downloaded file", justify="left", style="red")
+    table.add_column("File size", justify="center", style="white")
+    # table.add_column("Scan Start Date and Time (UTC)", style="red", justify='center')
+    with Progress(disable=False, console=state.console, transient=True) as progress:
         #progress.console.status("[bold blue]Calculating granule temporal anchors...")
         dt = datetime.strptime(timestamp, '%Y%m%d%H%M')
-        items = await locate_file(satellite=satellite,dt=dt,source=source, products=products)
-        down = await fetch_ntl(found_paths=items, dst_dir=dest_dir, satellite=satellite, progress=progress)
-        print(down)
+        found_files = await locate_file(satellite=satellite,dt=dt,source=source, products=products)
+        downloaded_files = await fetch_ntl(found_paths=found_files, dst_dir=dest_dir, satellite=satellite, progress=progress)
+        for local_file_path, file_size in downloaded_files.items():
+            # _, file_name = os.pa
+            values = satellite, timestamp, f'{local_file_path}', f'{bytesto(file_size, "m"):.2f} MB'
+            table.add_row(*values)
+
+    state.console.print(table)

@@ -5,7 +5,7 @@ import click
 import uvloop
 from rich.console import Console
 from rich.logging import RichHandler
-from ntl.search.commands import search
+from ntl.search.commands import async_search
 from ntl.io.commands import download
 
 
@@ -95,7 +95,7 @@ def cli(ctx, debug):
 #
 # find.add_command(granules)
 
-cli.add_command(search)
+cli.add_command(async_search, name='search')
 cli.add_command(download)
 
 

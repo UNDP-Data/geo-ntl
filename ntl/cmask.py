@@ -271,12 +271,20 @@ def cloud_coverage(hdf_url: str, bbox: Iterable[float],
     """
     roi_lon_min, roi_lat_min, roi_lon_max, roi_lat_max = bbox
     k = 5  # Decimation factor
-
+    purl = urllib.parse.urlparse(hdf_url)
+    rel_path, file_name = os.path.split(purl.path)
     fs = fsspec.filesystem("http")
     try:
-        with fs.open(hdf_url, block_size=1024 * 1024) as f:
-            with h5py.File(f, "r") as hfile:
-                # 1. Fast Index Search (Decimated)
+        with fs.open(hdf_url, block_size=1024 * 1024) as fh5:
+            with h5py.File(fh5, "r") as hfile:
+
+                # 1. Verification Step: Ensure coordinates actually exist in this file
+                if lat_var not in hfile or lon_var not in hfile:
+                    raise KeyError(f"L2 file missing {lat_var}/{lon_var}. Must use GDNBO file for coords.")
+                if var_to_read not in hfile:
+                    raise KeyError(f"Variable {var_to_read} not found in this file.")
+
+                # 2. Fast Index Search (Decimated)
                 lats_small = hfile[lat_var][::k, ::k]
                 lons_small = hfile[lon_var][::k, ::k]
 
@@ -286,47 +294,72 @@ def cloud_coverage(hdf_url: str, bbox: Iterable[float],
                 )
 
                 if not np.any(valid_mask_small):
-                    return None
+                    raise Exception(f'{file_name} does not intersect bbox {bbox}')
 
-                # 2. Correct Index Conversion
+                # 3. Calculate bounding indices with decimation factor scaling
                 rows_idx, cols_idx = np.where(valid_mask_small)
-                # Multiply by k (the factor we used to slice), not 10
                 rmin, rmax = rows_idx.min() * k, rows_idx.max() * k
                 cmin, cmax = cols_idx.min() * k, cols_idx.max() * k
 
-                # 3. Apply Buffer and Clamp to Array Shape
+                # 4. Apply Buffer and Clamp to Array Shape
                 buf = 15
-                h_shape = hfile[lat_var].shape
-                rmin, rmax = max(0, rmin - buf), min(h_shape[0], rmax + buf)
-                cmin, cmax = max(0, cmin - buf), min(h_shape[1], cmax + buf)
+                lat_shape = hfile[lat_var].shape
 
-                # 4. Download Crop
+                rmin = max(0, rmin - buf)
+                rmax = min(lat_shape[0], rmax + buf)
+                cmin = max(0, cmin - buf)
+                cmax = min(lat_shape[1], cmax + buf)
+
+                # DEFENSE 1: Check for degenerate (empty or 1D) slices
+                if (rmax - rmin < 2) or (cmax - cmin < 2):
+                    raise Exception(f'{bbox} has yielded empty indices for {file_name} ')
+
+                # 5. Extract Crops
                 lats_crop = hfile[lat_var][rmin:rmax, cmin:cmax]
                 lons_crop = hfile[lon_var][rmin:rmax, cmin:cmax]
-                mask_crop = hfile[var_to_read][rmin:rmax, cmin:cmax]
 
-                # 5. Resampling
+                # DEFENSE 2: Handle potential 3D variable shapes
+                var_shape = hfile[var_to_read].shape
+                if len(var_shape) == 3:
+                    mask_crop = hfile[var_to_read][0, rmin:rmax, cmin:cmax]
+                else:
+                    mask_crop = hfile[var_to_read][rmin:rmax, cmin:cmax]
+
+                # DEFENSE 3: Mask out fill values to prevent pyresample skewing
+                mask_crop = mask_crop.astype(float)
+                mask_crop = np.where(mask_crop > 100, np.nan, mask_crop)
+
+                # 6. Pyresample Execution
                 swath_def = geometry.SwathDefinition(lons=lons_crop, lats=lats_crop)
+
+                # Setup target grid (50x50 pixels is standard for quick ROI stats)
                 area_def = geometry.AreaDefinition.from_extent(
-                    'roi', {'proj': 'latlong', 'datum': 'WGS84'},
-                    (50, 50), [roi_lon_min, roi_lat_min, roi_lon_max, roi_lat_max]
+                    'roi',
+                    {'proj': 'latlong', 'datum': 'WGS84'},
+                    (50, 50),
+                    [roi_lon_min, roi_lat_min, roi_lon_max, roi_lat_max]
                 )
 
                 resampled = kd_tree.resample_nearest(
-                    swath_def, mask_crop.astype(float), area_def,
-                    radius_of_influence=7000, fill_value=np.nan
+                    swath_def,
+                    mask_crop,
+                    area_def,
+                    radius_of_influence=7000,
+                    fill_value=np.nan
                 )
 
+                # 7. Final Coverage Computation
                 valid_data = resampled[~np.isnan(resampled)]
                 if valid_data.size == 0:
-                    return None
+                    raise Exception(f'{file_name} contains only nans inside bbox {bbox}')
 
-                # CloudMaskBinary: usually 1 is cloudy, 0 is clear.
-                # (Double check your product spec, sometimes it's reversed)
-                return int(valid_data[valid_data == 1].size / valid_data.size * 100)
+                # Calculate percentage. Ensure '1' actually means cloudy in your specific L2 spec!
+                cloudy_pixels = valid_data[valid_data == 1].size
+                total_valid = valid_data.size
+
+                return int((cloudy_pixels / total_valid) * 100)
 
     except Exception as e:
-        # Log error here or raise it to the batch handler
         raise
 
 
@@ -335,7 +368,7 @@ def cloud_coverage_batch(urls: list[str], bbox: Iterable[float], max_threads: in
     master_task = None
     if progress:
         master_task = progress.add_task(
-            description="[green]Computing cloud cover...",
+            description=f"[cyan]Computing cloud coverage .... ",
             total=len(urls)
         )
 
@@ -352,7 +385,7 @@ def cloud_coverage_batch(urls: list[str], bbox: Iterable[float], max_threads: in
             try:
                 results[url] = future.result()
             except Exception as e:
-                print(e, 'JUSSI')
+                logger.debug(e)
                 results[url] = e
             finally:
                 if progress and master_task is not None:
