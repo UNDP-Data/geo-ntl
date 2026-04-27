@@ -2,7 +2,7 @@
 Search for VIIRS satellites passes using pyrobital and TLE
 """
 import os.path
-
+import asyncio
 import numpy as np
 from pyorbital.orbital import Orbital
 from datetime import datetime, timedelta, date, time as dtime
@@ -15,7 +15,7 @@ import time
 import logging
 from typing import Iterable, Optional
 from ntl.io import rt
-import asyncio
+import click
 from enum import Enum
 from ntl.cmask import cloud_coverage_batch
 from ntl.io.rt import public_url, PRODUCTS_RE, parse_noaa_timestamp
@@ -27,7 +27,7 @@ TLE_URL = 'https://celestrak.org/NORAD/elements/gp.php?GROUP=weather'
 class SearchMode(Enum):
     ALL = "all"        # Level 1: No filters
     GEOM = "geom"      # Level 2: Physics-based (Elev/Offset)
-    CMASK = "cmask"    # Level 3: Science-based (CloudS Mask check)
+    CMASK = "cmask"    # Level 3: Science-based (Cloud Mask check)
 
 @dataclass
 class DescendingPass:
@@ -53,9 +53,14 @@ class Granule:
     offset:int
     elevation:float
     cloud_cover = None
+
     @property
     def id(self):
-        return f"{self.start_time:d%Y%m%d_t%H%M%S}{self.start_time.microsecond // 100000}"
+        return f"{self.start_time:%Y%m%d%H%M}" #{self.start_time.microsecond // 100000}
+
+    @property
+    def timestamp(self):
+        return f's{self.start_time:%Y%m%d%H%M%S}'
 
     @property
     def sat_rank(self):
@@ -66,14 +71,15 @@ class Granule:
     @property
     def rank(self):
         # The final score, heavily weighting clear skies over pure geometry
-        if self.cloud_cover is not None:
+        if str(self.cloud_cover).isnumeric():
             clear_sky_score = 100 - self.cloud_cover
             # 70% Weather, 30% Geometry
             return int((self.sat_rank * 0.3) + (clear_sky_score * 0.7))
 
         return int(self.sat_rank)
 
-
+    def __hash__(self):
+        return hash(str(self))
 
     def __repr__(self):
         return f'{self.sat} granule {self.id}  with sat rank {self.sat_rank:0f} and offset {self.offset} featuring elevation of {self.elevation} degrees '
@@ -141,6 +147,51 @@ def get_satellite_phase(timestamp_str:str=None, sat_name=None, tle_file="weather
 
     return phase
 
+async def granules2files(granules: list[Granule]=None, satellite: str = None,
+                         bbox: Iterable[float] = None, product: str = 'CM', strategy:str=None,
+                         progress:Progress=None):
+    results = {}
+
+    # 1. Handle the progress bar as a proper life-cycle object
+    progress_task = None
+    if progress:
+        progress_task = progress.add_task(
+            description=f'[cyan]Checking granules for satellite {satellite}',
+            total=len(granules)
+        )
+
+    async def track_task(agranule):
+        try:
+            return await rt.find_ntl(
+                satellite=satellite,
+                dt=agranule.start_time,
+                products=[product],
+                bbox=bbox,
+                strategy=strategy
+            )
+        finally:
+            if progress_task is not None:
+                progress.update(progress_task, advance=1)
+
+    try:
+        # 2. Use the TaskGroup for the heavy lifting
+        async with asyncio.TaskGroup() as tg:
+            task_map = {tg.create_task(track_task(g)): g for g in granules}
+
+        # 3. TaskGroup guarantees all tasks are done here
+        results = {g: t.result() for t, g in task_map.items()}
+        return results
+
+    except ExceptionGroup as eg:
+        for e in eg.exceptions:
+            logger.error(f"❌ Sub-task failed: {e}")
+        return results  # Or handle as needed
+
+    finally:
+        if progress and progress_task is not None:
+            # FIX: Force the bar to hide and disappear immediately
+            progress.update(progress_task, visible=False)
+            progress.remove_task(progress_task)
 
 
 class VIIRSNavigator:
@@ -371,7 +422,7 @@ class VIIRSNavigator:
         # 3. THE TRIGGER (Use North-Lat to find when the satellite ENTERS the box)
         search_start = utc_anchor - timedelta(hours=night_hrs / 2)
         night_passes = self.orb.get_next_passes(search_start, night_hrs, midlon, midlat, 0) # northlat???
-        logger.debug(f'{self.satellite} passes {len(night_passes)} time(s) over {list(bbox)} on {target_date:%y-%m-%d}')
+        logger.debug(f'{self.satellite} passes {len(night_passes)} time(s) over {list(bbox)} on the night of {target_date:%y-%m-%d}')
         passes = []
         for _pass_ in night_passes:
             rise_time, fall_time, max_elev_time = _pass_
@@ -389,47 +440,52 @@ class VIIRSNavigator:
         return passes
 
 
-    def night_granules(self, bbox:Iterable[float]=None, target_date:date=None, strategy=None ):
+    def night_granules(self, bbox:Iterable[float]=None, target_date:date=None, strategy=None, progress=None ):
         midlon, midlat, northlat = self.decompose_bbox(bbox=bbox)
         passes = self.night_passes(target_date=target_date, bbox=bbox)
-        granules = {}
+
+        selected_granules = {}
+        granules = []
         for p in passes:
             look = self.orb.get_observer_look(p.max_elev_time, midlon, midlat, 0)
             elevation = look[1]
             if elevation < self.MIN_ELEVATION_ANGLE and strategy != SearchMode.ALL:
                 logger.debug(f'Skipping {p} because of low elevation angle {elevation:0f}')
                 continue
-            granule = self.pass2granule(p=p,midlon=midlon, midlat=midlat, elevation=elevation)
-            found = asyncio.run(
-                rt.find_ntl(
-                    satellite=self.satellite,
-                    dt=granule.start_time,
-                    products=['CM']  # , dst_dir='/tmp'
-                )
-            )
+            granule = self.pass2granule(p=p,midlon=midlon, midlat=midlat, elevation=elevation, )
+            granules.append(granule)
 
-            if found:
-                time_pattern = granule.start_time.strftime(f's%Y%m%d%H%M')
-                (source, entry), = found.items()
-                cm_file_path, _ = entry[0]
-                rex = PRODUCTS_RE['CM']
-                _, fname = os.path.split(cm_file_path)
-                if not time_pattern in fname:
-                    m = rex.match(fname)
-                    if m:
-                        parts = m.groupdict()
-                        starts = parts['start']
-                        start_time = parse_noaa_timestamp(starts)
-                        granule.start_time = start_time
 
-            if strategy != SearchMode.ALL:
-                    public_cm_url = public_url(file_path=cm_file_path,satellite=self.satellite, source=source)
-                    granules[public_cm_url] = p,granule
+        geom_granules = asyncio.run(granules2files(
+            granules=granules,satellite=self.satellite, bbox=bbox, progress=progress, strategy=strategy
+        ))
 
+        for current_granule, found in geom_granules.items():
+            if not found:
+                continue
+
+            # Safely get the first source/entry
+            (source, entries), = found.items()
+            file_path, _ = entries[0]
+
+            # Correct the timestamp on the CURRENT granule (g), not the stale one
+            _, file_name = os.path.split(file_path)
+            if current_granule.timestamp not in file_name:
+                m = PRODUCTS_RE['CM'].match(file_name)
+                if m:
+                    start_time = parse_noaa_timestamp(m.groupdict()['start'])
+                    current_granule.start_time = start_time
+
+            if strategy == SearchMode.CMASK:
+                # Use the unique URL as the key (Always unique)
+                url = public_url(file_path=file_path, satellite=self.satellite, source=source)
+                selected_granules[url] = current_granule
             else:
-                granules[p] = granule
+                # Use the unique file_path as the key to prevent SNPP/N20/N21 overwrites
+                selected_granules[file_path] = current_granule
 
-        return granules
+
+        return selected_granules
 
 
     def best_pass(self, bbox:Iterable[float]=None, target_date:date=None, ):
@@ -532,66 +588,6 @@ class VIIRSNavigator:
     #
 
 
-def compute_best_pass(satellites:Optional[Iterable[str]]=None, target_date:date=None, bbox:Iterable[float] = None)->Iterable[Path]:
-    """
-        Given an event associated with a target date and a geographic area of interest represented through a
-        bounding box identify the best VIIRS DNB satellite (Suomi NPP, NOAA 20, NOAA 21) using pyorbital.
-
-        For each satellite there are several passes given away by pyorbital and the best candidate image is selected so
-        that the elevation angle is maximized and the distance from the center of bbox to the sub-satellite point is
-        minimized.
-
-        Consequently, the best candidate from all satellites is selected based on the offset distance but only if
-        a satellite is not specified. Otherwise the candidate will be selected from the specific satellite.
-        Args:
-            @satellite, str, the name of teh desired satellite or None to use all
-            @target_date, date the desired date for which the pass will be selected
-            @bbox,  lonmin, latmin, lonmax, latmax, iterable of floats
-
-        Returns:
-            an iterable with information related to the best pass
-            satellite, datetime when the satellite started the scan, a timestamp to be sued for filtering cloud buckets for data
-            and the distance offset in km from the center of bbox to the sub-satellite point at maximum elevation
-
-
-
-    """
-    satellite_names = list(VIIRSNavigator.SAT_CONFIGS.keys())
-    assert isinstance(target_date, date), f'invalid target date {target_date}'
-    satellites = satellites or satellite_names
-    results = []
-    logger.info(f'Searching for NTL data for {target_date:%y-%m-%d} over bbox {list(bbox)} and {len(satellites)} satellites(s) ')
-    for sat in satellites:
-        logger.debug(f'Calculating best pass for satellite {sat} on target {target_date:%Y-%m-%d} over bbox {list(bbox)}')
-        nav = VIIRSNavigator(satellite=sat)
-        result = nav.best_pass(bbox, target_date)
-        logger.debug(f'Computed best pass for satellite {result[0]}  for target date {target_date:%Y-%m-%d} on {result[1]:%Y-%m-%d} at {result[1]:%H:%M} UTC')
-        results.append(result)
-    if results:
-        sorted_results = sorted(results, key=lambda e:e[-1], reverse=True)
-        logger.info(f'Selected best pass at  {sorted_results[-1][2]} generated by {sorted_results[-1][0]}')
-        return sorted_results[-1]
-
-    else:
-        logger.info(f'Could not find NTL data from NOAA satellites {satellite_names} for {target_date} and {bbox} ')
-
-
-def compute_passes(satellites:Optional[Iterable[str]]=None, target_date:date=None, bbox:Iterable[float] = None,
-                   optimize=False) -> dict[DescendingPass:Granule]:
-
-    satellite_names = list(VIIRSNavigator.SAT_CONFIGS.keys())
-    assert isinstance(target_date, date), f'invalid target date {target_date}'
-    satellites = satellites or satellite_names
-    all_passes = {}
-    for sat in satellites:
-        #logger.debug(f'Calculating best pass for satellite {sat} on target {target_date:%Y-%m-%d} over bbox {list(bbox)}')
-        nav = VIIRSNavigator(satellite=sat)
-        passes = nav.night_passes(bbox=bbox, target_date=target_date,optimize=optimize )
-        #logger.debug(f'Computed  {len(passes)}  for target date {target_date:%Y-%m-%d} on {passes[1]:%Y-%m-%d} at {passes[1]:%H:%M} UTC')
-        all_passes.update(passes)
-    return all_passes
-
-
 def search_granules(satellites:Optional[Iterable[str]]=None, target_date:date=None, bbox:Iterable[float] = None,
                    strategy=None, progress=None):
     satellite_names = list(VIIRSNavigator.SAT_CONFIGS.keys())
@@ -600,21 +596,25 @@ def search_granules(satellites:Optional[Iterable[str]]=None, target_date:date=No
     granules = []
     granules_pasess = {}
     for sat in satellites:
-        logger.info(f'Locating imaghery (data granules) for {sat} satellite')
+        logger.debug(f'Locating imagery (data granules) for {sat} satellite')
         nav = VIIRSNavigator(satellite=sat)
-        sat_granules = nav.night_granules(bbox=bbox, target_date=target_date, strategy=strategy)
+        sat_granules = nav.night_granules(bbox=bbox, target_date=target_date, strategy=strategy, progress=progress)
         granules_pasess.update(sat_granules)
-
-    if strategy != SearchMode.ALL:
+    if strategy == SearchMode.CMASK:
         cloud_coverage_results = cloud_coverage_batch(urls=list(granules_pasess.keys()), bbox=bbox, progress=progress)
-        for cm_url, e in granules_pasess.items():
-            p, g = e
-            g.cloud_cover = cloud_coverage_results[cm_url]
+
+        for cm_url, g in granules_pasess.items():
+            cloud_cover = cloud_coverage_results[cm_url]
+            if cloud_cover is None:cloud_cover = 'Not Available'
+            if isinstance(cloud_cover, Exception):
+                continue
+            g.cloud_cover = cloud_cover
+            g.url = os.path.split(cm_url)[-1]
             granules.append(g)
         granules.sort(key=lambda g: g.rank, reverse=True)
 
-        if strategy == SearchMode.CMASK:
-            return granules[-1:]
+        # if strategy == SearchMode.CMASK:
+        #     return granules[-1:]
         return granules
     else:
         granules = list(granules_pasess.values())

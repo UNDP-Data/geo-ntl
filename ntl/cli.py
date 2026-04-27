@@ -6,6 +6,7 @@ import uvloop
 from rich.console import Console
 from rich.logging import RichHandler
 from ntl.search.commands import search
+from ntl.io.commands import download
 
 
 # 1. Global Setup
@@ -22,6 +23,7 @@ class State:
 def setup_logging(debug: bool):
     level = logging.DEBUG if debug else logging.INFO
     logging.getLogger('pyorbital').setLevel(logging.WARNING)
+    logging.getLogger('fsspec').setLevel(logging.WARNING)
     logging.basicConfig(
         level=level,
         format="%(message)s",
@@ -94,5 +96,8 @@ def cli(ctx, debug):
 # find.add_command(granules)
 
 cli.add_command(search)
+cli.add_command(download)
+
+
 if __name__ == "__main__":
     cli()
