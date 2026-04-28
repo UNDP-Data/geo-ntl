@@ -7,7 +7,7 @@ from affine import Affine
 import math
 import logging
 from scipy.ndimage import zoom
-import matplotlib.pyplot as plt
+#
 import fsspec
 from typing import Iterable, Any
 from ntl.utils.vector import bbox_to_geojson_polygon
@@ -398,7 +398,7 @@ def cloud_coverage_batch(urls: list[str], bbox: Iterable[float], max_threads: in
 
 def plot(array):
     # 1. Convert to NanoWatts and clean (The magic fix for satellite data)
-
+    import matplotlib.pyplot as plt
 
 
 
@@ -447,7 +447,7 @@ if __name__ == '__main__':
     cm1 = cloud_coverage(hdf_url=cm_remote, bbox=nairobi_bbox,
                          lon_var='Longitude', lat_var='Latitude', var_to_read=HDF_VARS['CLOUD_MASK'])
 
-    plot(cm1[1])
+    #plot(cm1[1])
 
     # cm1 = read_ntl_file(src=cm_path,var_name=HDF_VARS['CLOUD_MASK'], indices=ind,is_cmask=True)
     #

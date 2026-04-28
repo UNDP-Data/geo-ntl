@@ -3,10 +3,10 @@ import logging
 import re
 import sys
 from enum import Enum
-from dotenv import load_dotenv
+
 import argparse
 import httpx
-from dotenv import load_dotenv
+
 import argparse
 from datetime import datetime, date, time, timedelta, timezone
 from typing import List, Tuple, Dict, Optional
