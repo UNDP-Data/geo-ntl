@@ -1,5 +1,6 @@
 import os
 import re
+from csv import excel_tab
 from pathlib import Path
 from datetime import datetime
 import h5py
@@ -92,12 +93,37 @@ def resolve_ntl_api(sat:str=None, product:str=None):
     return f"{CONTENT_API[stream]}/{product_code}/"
 
 
+def fetch_product_years(api_url:str):
+    try:
+        data = httpx.get(api_url).json()['content']
+        return tuple(map(int, [e['name'] for e in data]))
+    except Exception:
+        return
+
+def fetch_product_doys(api_url:str, year:int):
+    try:
+        year_api_url = os.path.join(api_url, f'{year}')
+        data = httpx.get(year_api_url).json()['content']
+        return tuple(map(int, [e['name'] for e in data]))
+    except Exception:
+        return
+
+
 def get_content_api_url(sat: str, product: str, year: int, doy: int) -> str:
     """Builds the JSON API endpoint dynamically based on the product suffix."""
-
+    target_datetime = datetime.strptime(f'{year}{doy:03d}', '%Y%j')
     root_api_url = resolve_ntl_api(sat=sat, product=product)
+    if not root_api_url:
+        raise Exception(f'No imagery exists for satellite  {sat} and product {product}')
 
-    api_url = os.path.join(root_api_url, year, f'{doy:03d}')
+    available_product_years = fetch_product_years(root_api_url)
+    if not year in available_product_years:
+        raise Exception(f'No imagery exists for year {year} satellite {sat} and product {product}')
+
+    available_year_doys = fetch_product_doys(api_url=root_api_url, year=year)
+    if not doy in available_year_doys:
+        raise Exception(f'No imagery exists for {target_datetime:%Y-%m-%d} satellite {sat} product {product}')
+    api_url = os.path.join(root_api_url, f'{year}', f'{doy:03d}')
 
     # 3. Route to the correct API base URL
     return api_url
@@ -112,10 +138,19 @@ def create_vrt_from_local(h5_path: str, vrt_path: str = None):
 
     # 1. Extract the geographic bounds directly from the HDF5 attributes
     with h5py.File(h5_path, 'r') as f:
-        west = f.attrs['WestBoundingCoord'][0]
-        north = f.attrs['NorthBoundingCoord'][0]
-        east = f.attrs['EastBoundingCoord'][0]
-        south = f.attrs['SouthBoundingCoord'][0]
+
+        def extract_val(attr_name):
+            val = f.attrs[attr_name]
+            # Try to grab the first element if it's an array/list, otherwise return the scalar
+            try:
+                return float(val[0])
+            except (IndexError, TypeError):
+                return float(val)
+
+        west = extract_val('WestBoundingCoord')
+        north = extract_val('NorthBoundingCoord')
+        east = extract_val('EastBoundingCoord')
+        south = extract_val('SouthBoundingCoord')
 
     # 2. Calculate the GDAL Geotransform
     # Daily VIIRS 46A1 tiles are always exactly 2400 x 2400
@@ -200,8 +235,7 @@ async def discover_granules(client: httpx.AsyncClient, sat_key: str, prod_type: 
     Queries the MODAPS Content API and parses the native download links.
     """
     url = get_content_api_url(sat_key, prod_type, year, doy)
-    print(url, 'https://nrt3.modaps.eosdis.nasa.gov/api/v2/content/archives/allData/5200/VNP46A1_NRT')
-    exit()
+
     try:
         resp = await client.get(url)
 
@@ -237,10 +271,10 @@ async def discover_granules(client: httpx.AsyncClient, sat_key: str, prod_type: 
         return valid_granules
 
     except httpx.HTTPStatusError as e:
-        logger.error(f"HTTP Error discovering {sat_key} {prod_type} ({stream}): {e.response.status_code}")
+        logger.error(f"HTTP Error discovering {sat_key} {prod_type} : {e.response.status_code}")
         return []
     except Exception as e:
-        logger.error(f"Error discovering {sat_key} {prod_type} ({stream}): {e}")
+        logger.error(f"Error discovering {sat_key} {prod_type} : {e}")
         return []
 
 async def locate_ntl_by_timestamp(
@@ -248,7 +282,7 @@ async def locate_ntl_by_timestamp(
         timestamp_str: str,
         sat_key: str,
         tile: str,
-        prod_type: str = "46A2_NRT",
+        product: str = "46A2_NRT",
 
 ):
     """
@@ -262,10 +296,8 @@ async def locate_ntl_by_timestamp(
     logger.info(f"Target: {sat_key} | Date: {dt.strftime('%Y-%m-%d')} (DOY: {doy:03d}) | Tile: {tile}")
 
     # 2. Hit the JSON API using the engine we built
-    granules = await discover_granules(client, sat_key, prod_type, year, doy)
+    granules = await discover_granules(client, sat_key, product, year, doy)
 
-    for e in granules:
-        print(e['meta']['tile'])
 
     # 3. Isolate the specific geographic tile
     tile_matches = [g for g in granules if g['meta']['tile'] == tile]
@@ -287,7 +319,7 @@ async def locate_ntl_by_timestamp(
 
 
 
-async def fetch_n21_winner(timestamp:str=None, satellite:str=None, bbox:tuple[float] = None, dst_dir='/tmp'):
+async def fetch_n21_winner(timestamp:str=None, satellite:str=None, product:str=None, bbox:tuple[float] = None, dst_dir='/tmp'):
     # Your App Key for MODAPS
     ea_token = os.environ.get('EARTHDATA_TOKEN')
     headers = {"Authorization": f"Bearer {ea_token}"}
@@ -308,7 +340,8 @@ async def fetch_n21_winner(timestamp:str=None, satellite:str=None, bbox:tuple[fl
                     client=client,
                     timestamp_str=timestamp,
                     sat_key=satellite,
-                    tile=tile
+                    tile=tile,
+                    product=product
                 ))
             results = await asyncio.gather(*tasks)
 
@@ -316,7 +349,6 @@ async def fetch_n21_winner(timestamp:str=None, satellite:str=None, bbox:tuple[fl
             if results:
                 tasks = []
                 for result in results:
-                    print(result)
                     url, size = result['url'], result['size']
                     print("\n--- Payload for obstore ---")
                     print(f"Direct URL: {url}")
@@ -339,7 +371,6 @@ async def fetch_n21_winner(timestamp:str=None, satellite:str=None, bbox:tuple[fl
 
             for local_file in res:
                 if local_file.exists():
-
                     vrt = create_vrt_from_local(str(local_file))
 
 
@@ -362,9 +393,10 @@ if __name__ == '__main__':
     target_date = datetime(2026, 4, 16)
     bbox = 50.8218, 34.5952, 50.931, 34.685
     timestamp = '202604152129'
-    satellite = 'n21'
-    list_available_products()
-    #asyncio.run(fetch_n21_winner(timestamp=timestamp,satellite=satellite, bbox=bbox))
+    satellite = 'snpp'
+    product='46A2'
+    #list_available_products()
+    asyncio.run(fetch_n21_winner(timestamp=timestamp,satellite=satellite, product=product, bbox=bbox))
     # print(agent)
     # fpath = '/tmp/VJ246A1.A2026105.h23v05.002.2026106182536.h5'
     # create_vrt_from_local(h5_path=fpath)
