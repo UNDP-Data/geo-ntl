@@ -14,11 +14,11 @@ from rich.progress import Progress
 import time
 import logging
 from typing import Iterable, Optional
-from ntl.io import rt
+from ntl.io import operational
 import click
 from enum import Enum
 from ntl.cmask import cloud_coverage_batch
-from ntl.io.rt import public_url, PRODUCTS_RE, parse_noaa_timestamp
+from ntl.io.operational import public_url, PRODUCTS_RE, parse_noaa_timestamp
 
 logger = logging.getLogger(__name__)
 
@@ -161,7 +161,7 @@ async def granules2files(granules: list[Granule]=None, satellite: str = None,
 
     async def track_task(agranule):
         try:
-            return await rt.find_ntl(
+            return await operational.find_ntl(
                 satellite=satellite,
                 dt=agranule.start_time,
                 products=[product],

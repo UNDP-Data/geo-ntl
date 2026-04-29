@@ -1,9 +1,9 @@
 from rich.table import Table
 import click
 from typing import Iterable
-from .rt import locate_file, fetch_ntl
+from .operational import locate_file, fetch_ntl
 from ntl.search.orbital import  VIIRSNavigator
-from ntl.io.rt import PRODUCT_NAMES, SOURCE_NAMES
+from ntl.io.operational import PRODUCT_NAMES, SOURCE_NAMES
 from rich.progress import Progress
 from datetime import datetime
 from ntl.io import bytesto
