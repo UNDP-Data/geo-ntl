@@ -119,11 +119,23 @@ def get_content_api_url(sat: str, product: str, year: int, doy: int) -> str:
     available_product_years = fetch_product_years(root_api_url)
     if not year in available_product_years:
         raise Exception(f'No imagery exists for year {year} satellite {sat} and product {product}')
-
     available_year_doys = fetch_product_doys(api_url=root_api_url, year=year)
-    if not doy in available_year_doys:
-        raise Exception(f'No imagery exists for {target_datetime:%Y-%m-%d} satellite {sat} product {product}')
-    api_url = os.path.join(root_api_url, f'{year}', f'{doy:03d}')
+    if not 'A3' in product:
+        if not doy in available_year_doys:
+            raise Exception(f'No imagery exists for {target_datetime:%Y-%m-%d} satellite {sat} product {product}')
+        api_url = os.path.join(root_api_url, f'{year}', f'{doy:03d}')
+    else:
+        available_months = tuple(map(int, [datetime.strptime(f'{year}{e:03d}', '%Y%j').month for e in available_year_doys]))
+        delta = [(i, abs(m-target_datetime.month)) for i, m in enumerate(available_months)]
+        best_match = min(delta, key=lambda x: x[1])
+
+        # Extract the index from the best match
+        best_index = best_match[0]
+
+        # Use the index to get the actual month
+        closest_doy = available_year_doys[best_index]
+        api_url = os.path.join(root_api_url, f'{year}', f'{closest_doy:03d}')
+
 
     # 3. Route to the correct API base URL
     return api_url
@@ -235,7 +247,7 @@ async def discover_granules(client: httpx.AsyncClient, sat_key: str, prod_type: 
     Queries the MODAPS Content API and parses the native download links.
     """
     url = get_content_api_url(sat_key, prod_type, year, doy)
-
+    print(url)
     try:
         resp = await client.get(url)
 
@@ -249,6 +261,7 @@ async def discover_granules(client: httpx.AsyncClient, sat_key: str, prod_type: 
         for item in items:
 
             name = item['name']
+            print(name)
             match = NTL_FILENAME_PATTERN.match(name)
 
             if match:
@@ -319,7 +332,7 @@ async def locate_ntl_by_timestamp(
 
 
 
-async def fetch_n21_winner(timestamp:str=None, satellite:str=None, product:str=None, bbox:tuple[float] = None, dst_dir='/tmp'):
+async def fetch_winner(timestamp:str=None, satellite:str=None, product:str=None, bbox:tuple[float] = None, dst_dir='/tmp'):
     # Your App Key for MODAPS
     ea_token = os.environ.get('EARTHDATA_TOKEN')
     headers = {"Authorization": f"Bearer {ea_token}"}
@@ -394,9 +407,9 @@ if __name__ == '__main__':
     bbox = 50.8218, 34.5952, 50.931, 34.685
     timestamp = '202604152129'
     satellite = 'snpp'
-    product='46A2'
+    product='46A3'
     #list_available_products()
-    asyncio.run(fetch_n21_winner(timestamp=timestamp,satellite=satellite, product=product, bbox=bbox))
+    asyncio.run(fetch_winner(timestamp=timestamp, satellite=satellite, product=product, bbox=bbox))
     # print(agent)
     # fpath = '/tmp/VJ246A1.A2026105.h23v05.002.2026106182536.h5'
     # create_vrt_from_local(h5_path=fpath)

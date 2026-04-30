@@ -396,23 +396,7 @@ def cloud_coverage_batch(urls: list[str], bbox: Iterable[float], max_threads: in
 
 
 
-def plot(array):
-    # 1. Convert to NanoWatts and clean (The magic fix for satellite data)
-    import matplotlib.pyplot as plt
 
-
-
-    # 2. The Matplotlib Plot
-    plt.figure(figsize=(10, 8))
-
-    # imshow is perfect for 2D spatial arrays
-    # 'magma' or 'inferno' are great colormaps for night lights
-    img = plt.imshow(array, cmap='magma', interpolation='nearest')
-
-    plt.colorbar(img, label='Log Radiance (NanoWatts)')
-    plt.title("Nairobi Night Lights - Zero Drama Edition")
-
-    plt.show()
 if __name__ == '__main__':
     from datetime import datetime
     import asyncio
