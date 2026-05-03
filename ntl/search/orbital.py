@@ -1,6 +1,7 @@
 """
 Search for VIIRS satellites passes using pyrobital and TLE
 """
+import json
 import os.path
 import asyncio
 import numpy as np
@@ -9,7 +10,7 @@ from datetime import datetime, timedelta, date, time as dtime
 from pathlib import Path
 import math
 import httpx
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from rich.progress import Progress
 import time
 import logging
@@ -77,8 +78,11 @@ class Granule:
     def __hash__(self):
         return hash(str(self))
 
+    def __str__(self):
+        ddict = dict(satellite=self.sat, timestamp=self.timestamp,offset_km=self.offset,elevation=self.elevation, cloud_coverage=self.cloud_cover, rank=self.rank)
+        return json.dumps(ddict, separators=(',', ':'),)
     def __repr__(self):
-        return f'{self.sat} granule {self.id}  with sat rank {self.sat_rank:0f} and offset {self.offset} featuring elevation of {self.elevation} degrees '
+        return f'{self.sat} granule {self.id}  with sat rank {self.sat_rank:0d} and offset {self.offset} km from SSP featuring elevation of {self.elevation:.0f} degrees '
 
 
 
@@ -585,18 +589,12 @@ async def async_search_granules(satellites:Optional[Iterable[str]]=None, target_
         for e in eg.exceptions:
             logger.error(f"❌ Sub-task failed: {e}")
 
-
-
     finally:
         if progress and progress_task is not None:
             progress.remove_task(progress_task)
 
-
-
-
     if cmask:
         cloud_coverage_results = cloud_coverage_batch(urls=list(found_granules.keys()), bbox=bbox, progress=progress)
-
         for cm_url, g in found_granules.items():
             cloud_cover = cloud_coverage_results[cm_url]
             if cloud_cover is None:cloud_cover = 'Not Available'
@@ -606,11 +604,14 @@ async def async_search_granules(satellites:Optional[Iterable[str]]=None, target_
             g.url = os.path.split(cm_url)[-1]
             selected_granules.append(g)
         selected_granules.sort(key=lambda g: g.rank, reverse=True)
-        return selected_granules
+
     else:
         selected_granules = list(found_granules.values())
         selected_granules.sort(key=lambda g: g.rank, reverse=True)
-        return selected_granules
+
+
+
+    return selected_granules
 
 if __name__ == '__main__':
     import asyncio

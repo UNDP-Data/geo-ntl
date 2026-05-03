@@ -1,7 +1,7 @@
 import numpy as np
 from scipy.ndimage import label
 
-def ransac(x, y, iterations=100, threshold=5.0):
+def ransac(x=None, y=None, iterations=100, threshold=5.0):
     """
     Calculates RANSAC linear regression using only standard NumPy.
     """
@@ -35,7 +35,7 @@ def ransac(x, y, iterations=100, threshold=5.0):
 
     return best_slope, best_intercept
 
-def calculate_dynamic_threshold(raw_pixels, baseline_pixels, multiplier=3.0):
+def calculate_dynamic_threshold(baseline_pixels=None, raw_pixels=None , multiplier=3.0):
     """
     Calculates a data-driven RANSAC threshold using MAD.
     """
@@ -55,8 +55,8 @@ def calculate_dynamic_threshold(raw_pixels, baseline_pixels, multiplier=3.0):
     dynamic_threshold = multiplier * robust_std
 
     # Safety rail: Establish an absolute minimum noise floor for perfectly clear nights
-    return max(dynamic_threshold, .75)
-
+    #return max(dynamic_threshold, .75)
+    return dynamic_threshold
 
 
 

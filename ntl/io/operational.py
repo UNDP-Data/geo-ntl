@@ -26,6 +26,7 @@ PRODUCTS={
     'GEO':"VIIRS-DNB-GEO",
     'CM':"VIIRS-JRR-CloudMask"
 }
+PRODUCT2NAME = dict((v, k) for k, v in PRODUCTS.items())
 
 
 PRODUCT_NAMES = tuple(PRODUCTS)
@@ -88,10 +89,12 @@ async def fetch_file(satellite:str=None, provider:str=None, path:str=None, size:
             os.mkdir(adir)
         down_task = None
         store = viirs_stores[satellite][provider]
-        fname = os.path.basename(path)
+        rel_path, file_name = os.path.split(path)
+        product = rel_path.split('/')[0]
+        product_name = PRODUCT2NAME[product]
         if progress:
-            down_task = progress.add_task(f'[red]Downloading  {fname} from {provider}', total=size)
-        dst_file_path = os.path.join(adir, fname)
+            down_task = progress.add_task(f'[red]Downloading  {file_name} from {provider}', total=size)
+        dst_file_path = os.path.join(adir, file_name)
         response = await obstore.get_async(store, path)
         async with aiofiles.open(dst_file_path, 'wb') as local_file:
             # The 'get' call is the async request
@@ -102,8 +105,8 @@ async def fetch_file(satellite:str=None, provider:str=None, path:str=None, size:
 
         if os.stat(dst_file_path).st_size == size:
             if progress and progress_task is not None:
-                progress.update(progress_task, description=f'[green]Downloaded {fname} from {provider}', advance=1)
-            return dst_file_path, size
+                progress.update(progress_task, description=f'[green]Downloaded {file_name} from {provider}', advance=1)
+            return product_name, dst_file_path, size
     except Exception:
 
         raise
@@ -266,17 +269,20 @@ async def fetch_ntl(found_paths:dict[str, list]=None, satellite:str=None, dst_di
     finally:
         if progress and progress_task is not None:
             progress.remove_task(progress_task)
-        return dict([t.result() for t in tasks])
+        return [t.result() for t in tasks]
 
 
 
 
 
-async def find_and_fetch_ntl(
-        satellite:str=None, dt:datetime=None,
-        products:Iterable[str]=PRODUCT_NAMES, dst_dir='/tmp'
+
+async def download(satellite:str=None, timestamp:str=None, source:str=None,
+        products:Iterable[str]=PRODUCT_NAMES, dest_dir='/tmp'
 ):
-    found_paths = await find_ntl(satellite=satellite, dt=dt, products=products)
-    return await fetch_ntl(found_paths=found_paths,satellite=satellite, dst_dir=dst_dir)
+    dt = datetime.strptime(timestamp, '%Y%m%d%H%M')
+    found_files = await locate_file(satellite=satellite, dt=dt, source=source, products=products)
+
+
+    return  await fetch_ntl(found_paths=found_files, dst_dir=dest_dir, satellite=satellite)
 
 

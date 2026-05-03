@@ -1,6 +1,5 @@
 import os
 import re
-from csv import excel_tab
 from pathlib import Path
 from datetime import datetime
 import h5py
@@ -86,40 +85,45 @@ def resolve_ntl_api(sat:str=None, product:str=None):
 
     #based on logic from 2026
     if sat.upper() == N20 and product == '46A2_NRT':return
-    if sat.upper() == N21 and (product.endswith('_NRT') or product.endswith('A3') or product.endswith('A4')):return
+    if sat.upper() == N21 and product.endswith('_NRT'):return
 
     stream = NRT if product.endswith("_NRT") else STD
     product_code = f"{SATELLITES[sat.upper()]}{product}"
     return f"{CONTENT_API[stream]}/{product_code}/"
 
 
-def fetch_product_years(api_url:str):
+async def fetch_product_years(client:httpx.AsyncClient, api_url:str):
     try:
-        data = httpx.get(api_url).json()['content']
-        return tuple(map(int, [e['name'] for e in data]))
-    except Exception:
-        return
+        resp = await client.get(api_url)
+        resp.raise_for_status()
+        data = resp.json()['content']
+        return tuple(map(int, [itm['name'] for itm in data]))
+    except Exception as e:
+        logger.error(f'Failed on url  {api_url} with {e}')
+        return []
 
-def fetch_product_doys(api_url:str, year:int):
+async def fetch_product_doys(client:httpx.AsyncClient, api_url:str, year:int):
     try:
         year_api_url = os.path.join(api_url, f'{year}')
-        data = httpx.get(year_api_url).json()['content']
-        return tuple(map(int, [e['name'] for e in data]))
-    except Exception:
-        return
+        resp  = await client.get(year_api_url)
+        resp.raise_for_status()
+        data = resp.json()['content']
+        return tuple(map(int, [itm['name'] for itm in data]))
+    except Exception as e:
+        logger.error(f'Failed on url  {api_url} with {e}')
+        return []
 
 
-def get_content_api_url(sat: str, product: str, year: int, doy: int) -> str:
+async def get_content_api_url(client:httpx.AsyncClient, sat: str, product: str, year: int, doy: int) -> str:
     """Builds the JSON API endpoint dynamically based on the product suffix."""
     target_datetime = datetime.strptime(f'{year}{doy:03d}', '%Y%j')
     root_api_url = resolve_ntl_api(sat=sat, product=product)
     if not root_api_url:
         raise Exception(f'No imagery exists for satellite  {sat} and product {product}')
-
-    available_product_years = fetch_product_years(root_api_url)
+    available_product_years = await fetch_product_years(client, root_api_url)
     if not year in available_product_years:
         raise Exception(f'No imagery exists for year {year} satellite {sat} and product {product}')
-    available_year_doys = fetch_product_doys(api_url=root_api_url, year=year)
+    available_year_doys = await fetch_product_doys(client, api_url=root_api_url, year=year)
     if not 'A3' in product:
         if not doy in available_year_doys:
             raise Exception(f'No imagery exists for {target_datetime:%Y-%m-%d} satellite {sat} product {product}')
@@ -246,8 +250,8 @@ async def discover_granules(client: httpx.AsyncClient, sat_key: str, prod_type: 
     """
     Queries the MODAPS Content API and parses the native download links.
     """
-    url = get_content_api_url(sat_key, prod_type, year, doy)
-    print(url)
+    url = await get_content_api_url(client, sat_key, prod_type, year, doy)
+
     try:
         resp = await client.get(url)
 
@@ -261,7 +265,7 @@ async def discover_granules(client: httpx.AsyncClient, sat_key: str, prod_type: 
         for item in items:
 
             name = item['name']
-            print(name)
+
             match = NTL_FILENAME_PATTERN.match(name)
 
             if match:
@@ -346,6 +350,7 @@ async def fetch_winner(timestamp:str=None, satellite:str=None, product:str=None,
     semaphore = asyncio.Semaphore(5)
 
     async with httpx.AsyncClient(headers=headers, follow_redirects=True) as client:
+
         with Progress(disable=False,  transient=False) as progress:
             for hseg, vseg in tiles:
                 tile = f'h{hseg:02d}v{vseg:02d}'
@@ -382,9 +387,10 @@ async def fetch_winner(timestamp:str=None, satellite:str=None, product:str=None,
             # Execute all downloads concurrently
             res = await asyncio.gather(*tasks)
 
-            for local_file in res:
-                if local_file.exists():
-                    vrt = create_vrt_from_local(str(local_file))
+            #for local_file in res:
+                # if local_file.exists():
+                #     vrt = create_vrt_from_local(str(local_file))
+            return res[0]
 
 
 
@@ -408,8 +414,8 @@ if __name__ == '__main__':
     timestamp = '202604152129'
     satellite = 'snpp'
     product='46A3'
-    #list_available_products()
-    asyncio.run(fetch_winner(timestamp=timestamp, satellite=satellite, product=product, bbox=bbox))
+    list_available_products()
+    #asyncio.run(fetch_winner(timestamp=timestamp, satellite=satellite, product=product, bbox=bbox))
     # print(agent)
     # fpath = '/tmp/VJ246A1.A2026105.h23v05.002.2026106182536.h5'
     # create_vrt_from_local(h5_path=fpath)

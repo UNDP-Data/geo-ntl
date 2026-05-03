@@ -64,7 +64,7 @@ async def download(state, satellite:str=None, timestamp:str=None, products:Itera
         dt = datetime.strptime(timestamp, '%Y%m%d%H%M')
         found_files = await locate_file(satellite=satellite,dt=dt,source=source, products=products)
         downloaded_files = await fetch_ntl(found_paths=found_files, dst_dir=dest_dir, satellite=satellite, progress=progress)
-        for local_file_path, file_size in downloaded_files.items():
+        for _, local_file_path, file_size in downloaded_files:
             # _, file_name = os.pa
             values = satellite, timestamp, f'{local_file_path}', f'{bytesto(file_size, "m"):.2f} MB'
             table.add_row(*values)
